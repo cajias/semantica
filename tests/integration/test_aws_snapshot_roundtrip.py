@@ -47,23 +47,33 @@ NODE_ID = "roundtrip-source"
 TARGET_ID = "roundtrip-target"
 EDGE_TYPE = "relates_to"
 
+# Written after the last interval tick in the SIGKILL test, so it is expected to
+# be LOST -- that bounded loss is the guarantee, not a defect.
+LATE_NODE_ID = "post-tick-source"
+LATE_TARGET_ID = "post-tick-target"
 
-def _compose_env():
+# Longer than SNAPSHOT_INTERVAL on purpose. The SIGKILL test syncs to a tick and
+# then races the next one; a 6s interval leaves seconds of margin for the write
+# plus the kill, where 2s would leave a coin flip.
+KILL_INTERVAL = 6
+
+
+def _compose_env(interval=SNAPSHOT_INTERVAL):
     """Env for compose: the API key and a short snapshot interval."""
     return {
         **os.environ,
         "COMPOSE_PROJECT_NAME": COMPOSE_PROJECT,
         "SEMANTICA_API_KEY": API_KEY,
-        "SEMANTICA_SNAPSHOT_INTERVAL": str(SNAPSHOT_INTERVAL),
+        "SEMANTICA_SNAPSHOT_INTERVAL": str(interval),
     }
 
 
-def _compose(*args, timeout=BUILD_TIMEOUT, check=True):
+def _compose(*args, timeout=BUILD_TIMEOUT, check=True, interval=SNAPSHOT_INTERVAL):
     """Run `docker compose` against the repo-root compose file."""
     result = subprocess.run(
         ["docker", "compose", "-f", str(REPO_ROOT / "docker-compose.yml"), *args],
         cwd=str(REPO_ROOT),
-        env=_compose_env(),
+        env=_compose_env(interval),
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -98,7 +108,7 @@ def _skip_unless_docker_usable():
             pytest.skip("host port 8000 is already in use; the harness binds it")
 
 
-def _start_explorer():
+def _start_explorer(interval=SNAPSHOT_INTERVAL):
     """Bring up only the Explorer, waiting until it reports healthy.
 
     `--no-deps` skips the falkordb service on purpose: the Explorer reads
@@ -106,7 +116,7 @@ def _start_explorer():
     in semantica/explorer/app.py), so starting it would only cost an image
     pull.
     """
-    _compose("up", "-d", "--build", "--no-deps", "explorer")
+    _compose("up", "-d", "--build", "--no-deps", "explorer", interval=interval)
     _wait_for_health()
 
 
@@ -131,7 +141,7 @@ def _wait_for_health(timeout=HEALTH_TIMEOUT):
     )
 
 
-def _write_graph():
+def _write_graph(node_id=NODE_ID, target_id=TARGET_ID):
     """Write a node pair and an edge through the real REST API.
 
     `POST /api/import` is the only route that creates nodes and edges; the
@@ -139,10 +149,10 @@ def _write_graph():
     """
     payload = {
         "nodes": [
-            {"id": NODE_ID, "type": "entity", "metadata": {"probe": "roundtrip"}},
-            {"id": TARGET_ID, "type": "entity"},
+            {"id": node_id, "type": "entity", "metadata": {"probe": "roundtrip"}},
+            {"id": target_id, "type": "entity"},
         ],
-        "edges": [{"source": NODE_ID, "target": TARGET_ID, "type": EDGE_TYPE}],
+        "edges": [{"source": node_id, "target": target_id, "type": EDGE_TYPE}],
     }
     response = httpx.post(
         "{}/api/import".format(BASE_URL),
@@ -182,19 +192,75 @@ def _read_graph():
     return node_ids, edge_pairs
 
 
+def _snapshot_exists():
+    """True once the snapshot object is on the volume.
+
+    Read from inside the container: the named volume has no host path the test
+    can portably stat, and `python` is the one interpreter the runtime image is
+    guaranteed to have.
+    """
+    probe = _compose(
+        "exec",
+        "-T",
+        "explorer",
+        "python",
+        "-c",
+        "import os,sys;sys.exit(0 if os.path.exists("
+        "os.environ['SEMANTICA_SNAPSHOT_URI']) else 1)",
+        timeout=60,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+def _wait_for_snapshot(timeout=90):
+    """Block until the interval writer has produced the snapshot object.
+
+    Synchronising on the write instead of guessing the writer's phase is what
+    makes the bounded-loss assertion below deterministic: returning here means
+    a tick has just fired, so a near-full interval remains before the next one.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _snapshot_exists():
+            return
+        time.sleep(0.5)
+    raise AssertionError(
+        "The interval writer never created the snapshot object within {}s. "
+        "Nothing wrote SEMANTICA_SNAPSHOT_URI while the container was "
+        "running and healthy.".format(timeout)
+    )
+
+
+def _explorer_exit_code():
+    """Exit code of the stopped explorer container."""
+    container = _compose("ps", "-aq", "explorer", timeout=60).stdout.strip()
+    assert container, "No explorer container to inspect; the harness lost track of it."
+    inspected = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.ExitCode}}", container.splitlines()[0]],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return int(inspected.stdout.strip())
+
+
 @pytest.fixture
-def explorer_stack():
+def explorer_stack(request):
     """A freshly composed Explorer container on an empty snapshot volume.
 
     Function-scoped and volume-clean on both sides so the tests do not depend
     on each other's ordering: the empty-graph test needs a volume with no
     snapshot on it, which the round-trip test would otherwise have populated.
+
+    Indirect-parameterise to override the snapshot interval for one test.
     """
+    interval = getattr(request, "param", SNAPSHOT_INTERVAL)
     _skip_unless_docker_usable()
     _compose("down", "-v", timeout=300, check=False)  # drop any leftover volume
     try:
-        _start_explorer()
-        yield
+        _start_explorer(interval)
+        yield interval
     finally:
         _compose("down", "-v", timeout=300, check=False)
 
@@ -221,10 +287,13 @@ def test_graph_survives_container_restart(explorer_stack):
         "itself is broken. Saw edges: {}".format(sorted(edges_before))
     )
 
-    # Snapshot moment under test: the INTERVAL WRITER. Waiting longer than
-    # SEMANTICA_SNAPSHOT_INTERVAL means the snapshot must already be on disk
-    # before the container goes away, so this assertion does not silently
-    # depend on the shutdown snapshot instead.
+    # What this proves: the graph survives container recreation by SOME
+    # snapshot moment -- not which one. Sleeping past the interval means the
+    # interval writer *should* have run, but the assertion only inspects
+    # post-restart state, and the graceful `down` below sends SIGTERM, so the
+    # shutdown snapshot satisfies it equally. The graceful path is in fact the
+    # one this test exercises end to end; the interval writer is isolated by
+    # test_interval_writer_survives_sigkill, which denies the shutdown path.
     time.sleep(SNAPSHOT_INTERVAL * 2 + 1)
 
     # `down` (no -v) then `up` -- not `restart`. This destroys the container
@@ -247,6 +316,78 @@ def test_graph_survives_container_restart(explorer_stack):
         "came back with {} edge(s): {}. Node restore without edge restore "
         "means the snapshot is dropping relationships.".format(
             NODE_ID, TARGET_ID, len(edges_after), sorted(edges_after)
+        )
+    )
+
+
+@pytest.mark.parametrize("explorer_stack", [KILL_INTERVAL], indirect=True)
+def test_interval_writer_survives_sigkill(explorer_stack):
+    """GIVEN a container with a short SEMANTICA_SNAPSHOT_INTERVAL,
+    WHEN a node and edge are written, the interval is allowed to elapse, and
+    the container is then SIGKILLed rather than stopped gracefully,
+    THEN the graph is still present after the container is recreated.
+    """
+    # This is the abrupt-host-failure row of HLD section 5's failure table, and
+    # it is the only one of the three snapshot moments provable in isolation:
+    # SIGKILL gives uvicorn no chance to run its lifespan teardown, so
+    # SnapshotService.stop() never executes and no shutdown snapshot can exist.
+    # Startup restore and the shutdown snapshot cannot be isolated the same way
+    # -- restore is required by every test that reads data back, and denying the
+    # interval writer would mean an interval longer than the test.
+    _write_graph()
+
+    # Synchronise on the writer rather than sleeping a guessed amount. Returning
+    # means a tick just fired, so the whole node/edge set above is durable AND a
+    # near-full interval remains before the next tick -- which is what makes the
+    # bounded-loss assertion below deterministic rather than a race.
+    _wait_for_snapshot()
+
+    # Written after the last tick, so it is inside the loss window the design
+    # budgets for. Not a bug: HLD section 5 accepts losing up to one interval of
+    # edits on an abrupt kill, and that is precisely what is asserted below.
+    _write_graph(LATE_NODE_ID, LATE_TARGET_ID)
+
+    _compose("kill", "explorer", timeout=120)  # v2.29.7 defaults to SIGKILL
+
+    # How we know the graceful path did not run: 137 is 128+SIGKILL(9). A
+    # SIGTERM shutdown would exit 0. There is no shutdown-snapshot log line to
+    # grep for as a cross-check -- SnapshotService.stop() logs only on failure
+    # or a slow thread join -- so the exit code is the evidence, not a log.
+    exit_code = _explorer_exit_code()
+    assert exit_code == 137, (
+        "Expected exit 137 (128+SIGKILL) to prove the container died abruptly, "
+        "but it exited {}. A graceful exit means the shutdown snapshot could "
+        "have run, so this test would no longer isolate the interval "
+        "writer.".format(exit_code)
+    )
+
+    _compose("down", timeout=300)  # keep the volume, drop the killed container
+    _start_explorer(KILL_INTERVAL)
+
+    nodes_after, edges_after = _read_graph()
+    assert NODE_ID in nodes_after, (
+        "Node {!r} was snapshotted by the interval writer while the container "
+        "ran, but did not come back after SIGKILL. The graph returned {} "
+        "node(s): {}. Durability here rests only on the interval writer -- the "
+        "shutdown snapshot was denied -- so this means the interval writer is "
+        "not carrying data between snapshots, and HLD section 5's "
+        "bounded-loss claim does not hold.".format(
+            NODE_ID, len(nodes_after), sorted(nodes_after)
+        )
+    )
+    assert (NODE_ID, TARGET_ID, EDGE_TYPE) in edges_after, (
+        "Edge {!r} -> {!r} did not survive SIGKILL although its nodes did. The "
+        "interval writer is dropping relationships. Saw: {}".format(
+            NODE_ID, TARGET_ID, sorted(edges_after)
+        )
+    )
+    assert LATE_NODE_ID not in nodes_after, (
+        "Node {!r} was written after the last interval tick and should have "
+        "been lost to SIGKILL, but it came back. Either the shutdown snapshot "
+        "ran after all -- meaning this test does not isolate the interval "
+        "writer -- or a tick fired in the sub-second window before the kill, "
+        "which would make this assertion racy. Saw: {}".format(
+            LATE_NODE_ID, sorted(nodes_after)
         )
     )
 
