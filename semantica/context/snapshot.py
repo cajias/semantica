@@ -21,7 +21,7 @@ misconfiguration; this is the same principle applied to storage.
 import contextlib
 import os
 import tempfile
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.logging import get_logger
@@ -277,3 +277,63 @@ def suspended_mutations(graph: Any) -> Iterator[None]:
         yield
     finally:
         graph._suspend_mutation_callback = previous
+
+
+class SnapshotService:
+    """Ties a :class:`SnapshotStore` to the lifetime of a running process.
+
+    One object per process, wired into a server's lifespan. It exists so the
+    two FastAPI lifespans (``server.py`` and ``explorer/app.py``) share one
+    implementation instead of two copies that drift apart.
+
+    A ``store`` of None means ``SEMANTICA_SNAPSHOT_URI`` is unset: persistence
+    is off and every method is a no-op, so the wiring is unconditional and the
+    decision stays where it belongs, in deployment config. A ``graph`` of None
+    disables it the same way, which is what a caller whose graph failed to
+    build passes.
+    """
+
+    def __init__(
+        self,
+        graph: Any,
+        store: Optional[SnapshotStore],
+        after_restore: Optional[Callable[[], None]] = None,
+    ):
+        """
+        Args:
+            graph: The ``ContextGraph`` to restore into and snapshot from.
+            store: Destination, or None to disable persistence entirely.
+            after_restore: Called once after a successful restore, so a caller
+                can refresh state derived from the graph. The restore runs with
+                mutation notifications suspended, so nothing downstream --
+                the Explorer's search index, its embedding cache -- otherwise
+                learns that the nodes arrived.
+        """
+        self._graph = graph
+        self._store = store
+        self._after_restore = after_restore
+
+    @classmethod
+    def from_env(
+        cls, graph: Any, after_restore: Optional[Callable[[], None]] = None
+    ) -> "SnapshotService":
+        """Build a service from ``SEMANTICA_SNAPSHOT_URI``, disabled if unset."""
+        store = None if graph is None else snapshot_store_from_env()
+        return cls(graph, store, after_restore=after_restore)
+
+    def restore(self) -> bool:
+        """Load the snapshot into the graph before the process serves traffic.
+
+        Returns:
+            True if a snapshot was restored, False if none existed or
+            persistence is disabled.
+        """
+        store = self._store
+        if store is None:
+            return False
+        logger.info("context graph snapshots: %s", store.description)
+        with suspended_mutations(self._graph):
+            restored = store.load(self._graph)
+        if restored and self._after_restore is not None:
+            self._after_restore()
+        return restored

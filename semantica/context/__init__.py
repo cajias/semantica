@@ -129,8 +129,8 @@ from .decision_methods import (
 )
 from .graph_schema import setup_decision_schema, verify_schema, get_schema_info
 from .snapshot import (
-    SnapshotStore, snapshot_interval_from_env, snapshot_store_from_env,
-    suspended_mutations
+    SnapshotService, SnapshotStore, snapshot_interval_from_env,
+    snapshot_store_from_env, suspended_mutations
 )
 
 __all__ = [
@@ -179,6 +179,7 @@ __all__ = [
     "verify_schema",
     "get_schema_info",
     # Snapshot persistence
+    "SnapshotService",
     "SnapshotStore",
     "snapshot_store_from_env",
     "snapshot_interval_from_env",

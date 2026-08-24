@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
 from . import __version__
+from .context.snapshot import SnapshotService
 from .core.orchestrator import Semantica
 from .utils.logging import setup_logging
 
@@ -66,7 +67,17 @@ async def lifespan(app: FastAPI):
         app.state.session = None
         app.state.ws_manager = None
 
-    yield  
+    # Deliberately outside the try/except above: that block degrades to a
+    # session-less server, which for a failed restore would mean quietly
+    # serving an empty graph and letting the next snapshot make it permanent.
+    session = app.state.session
+    snapshots = SnapshotService.from_env(
+        session.graph if session else None,
+        after_restore=session.reload_graph if session else None,
+    )
+    snapshots.restore()
+
+    yield
 
     logging.info("Shutting down Semantica API...")
     if getattr(app.state, "session", None) and hasattr(app.state.session.graph, "close"):

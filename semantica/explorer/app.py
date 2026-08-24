@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .. import __version__
 from ..context.context_graph import ContextGraph
+from ..context.snapshot import SnapshotService
 from .dependencies import anonymous_access_allowed, get_expected_api_key, is_valid_api_key, require_auth
 from .session import GraphSession
 from .ws import ConnectionManager
@@ -118,6 +119,10 @@ def create_app(
         app.state.ws_manager = ConnectionManager()
         app.state.session = active_session
         _install_mutation_bridge(app, active_session)
+        snapshots = SnapshotService.from_env(
+            active_session.graph, after_restore=active_session.reload_graph
+        )
+        snapshots.restore()
         yield
 
     app = FastAPI(

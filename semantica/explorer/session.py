@@ -462,6 +462,16 @@ class GraphSession:
             ]
         self._search_index.rebuild(normalized_nodes)
 
+    def reload_graph(self) -> None:
+        """Refresh state derived from the graph after it was replaced wholesale.
+
+        A snapshot restore replays the whole graph with mutation notifications
+        suspended, so the search index built in ``__init__`` (from an empty
+        graph) and the cached embeddings would both stay stale. RELOAD_GRAPH is
+        the event ``handle_graph_mutation`` already recognises for exactly this.
+        """
+        self.handle_graph_mutation("RELOAD_GRAPH", "", {})
+
     def handle_graph_mutation(self, event_type: str, entity_id: str, payload: Dict[str, Any]) -> None:
         normalized_event = str(event_type or "").upper()
         if normalized_event in {
