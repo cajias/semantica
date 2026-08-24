@@ -684,6 +684,37 @@ def test_markdown_export_rejects_symlink_without_touching_target(tmp_path):
     assert outside.read_text(encoding="utf-8") == "do not overwrite"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_new_markdown_memory_file_is_owner_only(tmp_path):
+    """A newly exported memory file must stay at 0600.
+
+    Memory holds whatever the agent was told to remember, so on a shared host
+    or a multi-uid container a world-readable memory file is a disclosure. The
+    umask-derived mode the *snapshot* path wants (0644 under a 022 umask) is the
+    wrong default here; ``NamedTemporaryFile`` + ``os.replace`` left these files
+    owner-only before the writer was shared with ``save_to_file``.
+    """
+    memory = AgentMemory()
+    memory.store(
+        "The staging database password hint is the dog's name",
+        metadata={"type": "note", "updated_at": "2026-07-22T10:00:00"},
+        memory_id="mem_private",
+        timestamp=datetime(2026, 7, 22, 9, 0, 0),
+    )
+    destination = tmp_path / "export"
+
+    memory.export(format="markdown", destination=destination)
+
+    exported = sorted(destination.glob("*.md"))
+    assert exported, "nothing was exported"
+    for path in exported:
+        mode = stat.S_IMODE(os.stat(str(path)).st_mode)
+        assert mode == 0o600, (
+            f"{path.name} is {oct(mode)}, not owner-only; every new agent-memory "
+            "file is readable by any other account on the host"
+        )
+
+
 def test_empty_markdown_export_and_import_are_no_ops():
     memory = AgentMemory()
 

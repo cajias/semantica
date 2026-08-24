@@ -23,7 +23,7 @@ _DEFAULT_FILE_MODE = _default_file_mode()
 
 @contextlib.contextmanager
 def atomic_replace(
-    path: Union[str, Path], encoding: str = "utf-8"
+    path: Union[str, Path], mode: int = _DEFAULT_FILE_MODE
 ) -> Iterator[IO[str]]:
     """Yield a writable temp file whose content replaces *path* atomically.
 
@@ -35,6 +35,13 @@ def atomic_replace(
     itself, so a symlinked *path* is replaced rather than followed.
 
     Requires write permission on the destination's directory, not just the file.
+
+    Args:
+        path: Destination to replace.
+        mode: Permission bits for a *new* file. Defaults to what a plain
+            ``open(path, "w")`` would give, which is right for a snapshot an
+            operator reads and wrong for anything private -- pass ``0o600``
+            for that. An existing destination keeps its own mode either way.
     """
     file_path = os.fspath(path)
     # The temp file must share a filesystem with the destination or os.replace
@@ -45,7 +52,7 @@ def atomic_replace(
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
-            encoding=encoding,
+            encoding="utf-8",
             dir=directory,
             prefix="." + os.path.basename(file_path) + ".",
             suffix=".tmp",
@@ -62,12 +69,12 @@ def atomic_replace(
         # tempfile creates at 0600 and os.replace carries the temp file's mode
         # onto the destination. Keep an existing destination's permission bits,
         # masked to 0o777 because a plain write would not have propagated
-        # setuid/setgid/sticky; otherwise use what a plain open() would give.
+        # setuid/setgid/sticky; a new file gets the caller's requested mode.
         try:
-            mode = stat.S_IMODE(os.stat(file_path).st_mode) & 0o777
+            final_mode = stat.S_IMODE(os.stat(file_path).st_mode) & 0o777
         except OSError:
-            mode = _DEFAULT_FILE_MODE  # the normal first-write path
-        os.chmod(temporary_path, mode)
+            final_mode = mode
+        os.chmod(temporary_path, final_mode)
 
         os.replace(temporary_path, file_path)
         temporary_path = None
@@ -77,8 +84,8 @@ def atomic_replace(
 
 
 def atomic_write_text(
-    path: Union[str, Path], text: str, encoding: str = "utf-8"
+    path: Union[str, Path], text: str, mode: int = _DEFAULT_FILE_MODE
 ) -> None:
     """Write *text* to *path* via a temp file in the same directory + os.replace."""
-    with atomic_replace(path, encoding) as temporary_file:
+    with atomic_replace(path, mode) as temporary_file:
         temporary_file.write(text)
