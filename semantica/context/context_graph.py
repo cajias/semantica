@@ -1105,10 +1105,19 @@ class ContextGraph:
         """
         Save context graph to file (JSON format).
 
+        The write is atomic: the payload is serialised to a temporary file in
+        the destination's own directory, then moved over the destination with
+        ``os.replace``. A reader therefore sees either the previous snapshot or
+        the new one, never a half-written file. Writing straight to ``path``
+        would truncate it before the first byte of the new payload landed, so a
+        failure part-way through serialisation destroyed a good snapshot.
+
         Args:
             path: File path to save to
         """
         import json
+        import os
+        import tempfile
 
         with self._lock:
     
@@ -1130,8 +1139,34 @@ class ContextGraph:
                 "links": links_data,
             }
 
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        # The temp file must share a filesystem with the destination or
+        # os.replace fails with EXDEV, hence dir= rather than /tmp. dirname of a
+        # bare filename is "", so abspath first.
+        # ponytail: the temp file is fsynced but its containing directory is
+        # not, so a power loss immediately after os.replace could still lose the
+        # rename itself. Upgrade path if that matters: os.open(directory,
+        # os.O_RDONLY) and os.fsync that fd after the replace.
+        directory = os.path.dirname(os.path.abspath(path))
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=".context_graph-",
+            suffix=".tmp",
+            delete=False,
+        )
+        try:
+            with tmp as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp.name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass  # already gone, or never created; keep the real error
+            raise
 
         self.logger.info(f"Saved context graph to {path}")
 
