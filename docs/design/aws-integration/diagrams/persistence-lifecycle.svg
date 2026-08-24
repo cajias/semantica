@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 560" width="940" height="560" font-family="Helvetica, Arial, sans-serif">
+  <rect width="940" height="560" fill="#fbfbfd"/>
+  <text x="470" y="34" text-anchor="middle" font-size="19" font-weight="600" fill="#1a202c">Snapshot lifecycle</text>
+  <text x="470" y="56" text-anchor="middle" font-size="13" fill="#4a5568">State is captured at three moments; between them it exists only in memory</text>
+
+  <!-- PHASE 1 -->
+  <rect x="24" y="82" width="284" height="196" rx="10" fill="#ffffff" stroke="#2b6cb0" stroke-width="1.8"/>
+  <rect x="24" y="82" width="284" height="30" rx="10" fill="#ebf4ff"/>
+  <rect x="24" y="102" width="284" height="10" fill="#ebf4ff"/>
+  <text x="166" y="103" text-anchor="middle" font-size="12.5" font-weight="700" fill="#2b6cb0">1 — START UP</text>
+
+  <rect x="44" y="126" width="244" height="34" rx="5" fill="#f7fafc" stroke="#a0aec0" stroke-width="1.2"/>
+  <text x="166" y="148" text-anchor="middle" font-size="12" fill="#1a202c">container starts</text>
+  <path d="M 166 160 L 166 176" stroke="#2b6cb0" stroke-width="1.6" marker-end="url(#p1)"/>
+
+  <rect x="44" y="180" width="244" height="34" rx="5" fill="#ebf4ff" stroke="#2b6cb0" stroke-width="1.2"/>
+  <text x="166" y="202" text-anchor="middle" font-size="12" fill="#1a202c">retrieve snapshot object</text>
+  <path d="M 166 214 L 166 230" stroke="#2b6cb0" stroke-width="1.6" marker-end="url(#p1)"/>
+
+  <rect x="44" y="234" width="244" height="30" rx="5" fill="#f7fafc" stroke="#a0aec0" stroke-width="1.2"/>
+  <text x="166" y="254" text-anchor="middle" font-size="11.5" fill="#4a5568">absent? start empty, do not fail</text>
+
+  <path d="M 308 180 L 336 180" stroke="#4a5568" stroke-width="2" marker-end="url(#p2)"/>
+
+  <!-- PHASE 2 -->
+  <rect x="344" y="82" width="284" height="196" rx="10" fill="#ffffff" stroke="#2f855a" stroke-width="1.8"/>
+  <rect x="344" y="82" width="284" height="30" rx="10" fill="#f0fff4"/>
+  <rect x="344" y="102" width="284" height="10" fill="#f0fff4"/>
+  <text x="486" y="103" text-anchor="middle" font-size="12.5" font-weight="700" fill="#2f855a">2 — RUNNING</text>
+
+  <rect x="364" y="126" width="244" height="30" rx="5" fill="#f0fff4" stroke="#2f855a" stroke-width="1.2"/>
+  <text x="486" y="146" text-anchor="middle" font-size="12" fill="#1a202c">graph is changed</text>
+  <path d="M 486 156 L 486 170" stroke="#2f855a" stroke-width="1.6" marker-end="url(#p3)"/>
+
+  <rect x="364" y="174" width="244" height="30" rx="5" fill="#f0fff4" stroke="#2f855a" stroke-width="1.2"/>
+  <text x="486" y="194" text-anchor="middle" font-size="12" fill="#1a202c">mutation announced, marked unsaved</text>
+  <path d="M 486 204 L 486 218" stroke="#2f855a" stroke-width="1.6" marker-end="url(#p3)"/>
+
+  <rect x="364" y="222" width="244" height="30" rx="5" fill="#ffffff" stroke="#2f855a" stroke-width="1.6"/>
+  <text x="486" y="242" text-anchor="middle" font-size="12" fill="#1a202c">timer elapses, one snapshot written</text>
+  <text x="486" y="268" text-anchor="middle" font-size="11" font-style="italic" fill="#4a5568">a burst of edits yields one write, not many</text>
+
+  <path d="M 628 180 L 656 180" stroke="#4a5568" stroke-width="2" marker-end="url(#p2)"/>
+
+  <!-- PHASE 3 -->
+  <rect x="664" y="82" width="252" height="196" rx="10" fill="#ffffff" stroke="#b7791f" stroke-width="1.8"/>
+  <rect x="664" y="82" width="252" height="30" rx="10" fill="#fffaf0"/>
+  <rect x="664" y="102" width="252" height="10" fill="#fffaf0"/>
+  <text x="790" y="103" text-anchor="middle" font-size="12.5" font-weight="700" fill="#b7791f">3 — SHUT DOWN</text>
+
+  <rect x="684" y="126" width="212" height="34" rx="5" fill="#fffaf0" stroke="#b7791f" stroke-width="1.2"/>
+  <text x="790" y="148" text-anchor="middle" font-size="12" fill="#1a202c">stop signal received</text>
+  <path d="M 790 160 L 790 176" stroke="#b7791f" stroke-width="1.6" marker-end="url(#p4)"/>
+
+  <rect x="684" y="180" width="212" height="34" rx="5" fill="#fffaf0" stroke="#b7791f" stroke-width="1.2"/>
+  <text x="790" y="202" text-anchor="middle" font-size="12" fill="#1a202c">final snapshot written</text>
+  <path d="M 790 214 L 790 230" stroke="#b7791f" stroke-width="1.6" marker-end="url(#p4)"/>
+
+  <rect x="684" y="234" width="212" height="30" rx="5" fill="#f7fafc" stroke="#a0aec0" stroke-width="1.2"/>
+  <text x="790" y="254" text-anchor="middle" font-size="11.5" fill="#2f855a">redeployment is lossless</text>
+
+  <!-- exposure window -->
+  <rect x="24" y="306" width="892" height="112" rx="10" fill="#fff5f5" stroke="#c53030" stroke-width="1.8"/>
+  <text x="48" y="332" font-size="12.5" font-weight="700" fill="#c53030" letter-spacing="0.5">THE UNPROTECTED WINDOW</text>
+  <text x="48" y="358" font-size="13" fill="#742a2a">Between two snapshots, changes exist in one process and nowhere else.</text>
+  <text x="48" y="380" font-size="13" fill="#742a2a">An abrupt kill that skips the stop signal loses everything written since the last snapshot.</text>
+  <text x="48" y="404" font-size="13" font-weight="600" fill="#c53030">The snapshot interval is not a tuning preference — it is the amount of work you accept losing.</text>
+
+  <!-- growth note -->
+  <rect x="24" y="436" width="892" height="100" rx="10" fill="#ffffff" stroke="#cbd5e0" stroke-width="1.5"/>
+  <text x="48" y="462" font-size="12.5" font-weight="700" fill="#4a5568" letter-spacing="0.5">WHAT SETS THE FLOOR ON THE INTERVAL</text>
+  <text x="48" y="488" font-size="13" fill="#2d3748">Each snapshot serialises the whole graph while holding the lock that mutations also need.</text>
+  <text x="48" y="512" font-size="13" fill="#2d3748">As the graph grows, that serialisation cost — not the storage service — limits how often snapshots can be taken.</text>
+
+  <defs>
+    <marker id="p1" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#2b6cb0"/></marker>
+    <marker id="p2" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto"><path d="M0,0 L0,7 L9,3.5 z" fill="#4a5568"/></marker>
+    <marker id="p3" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#2f855a"/></marker>
+    <marker id="p4" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#b7791f"/></marker>
+  </defs>
+</svg>
