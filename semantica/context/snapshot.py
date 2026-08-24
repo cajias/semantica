@@ -27,8 +27,9 @@ from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.logging import get_logger
 
 try:
-    import boto3
-    from botocore.exceptions import ClientError
+    # No stubs are shipped and types-boto3 would be a new dependency.
+    import boto3  # type: ignore[import-untyped]
+    from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
     BOTO3_AVAILABLE = True
 except (ImportError, OSError):  # native wheels fail with OSError, not ImportError
@@ -92,9 +93,12 @@ class SnapshotStore:
             )
         self.uri = uri
         self._client = client
+        self.bucket: Optional[str]
+        self.key: Optional[str]
+        self.path: Optional[str]
         if uri.startswith(_S3_SCHEME):
             self.bucket, self.key = _parse_s3_uri(uri)
-            self.path = None  # type: Optional[str]
+            self.path = None
         else:
             self.bucket, self.key = None, None
             self.path = uri
@@ -112,14 +116,16 @@ class SnapshotStore:
         Returns:
             True if a snapshot was restored, False if none existed yet.
         """
-        if self.path is not None:
-            return self._load_file(graph)
+        path = self.path
+        if path is not None:
+            return self._load_file(graph, path)
         return self._load_object(graph)
 
     def save(self, graph: Any) -> None:
         """Write *graph* to the destination, replacing whatever is there."""
-        if self.path is not None:
-            self._save_file(graph)
+        path = self.path
+        if path is not None:
+            self._save_file(graph, path)
         else:
             self._save_object(graph)
 
@@ -135,29 +141,30 @@ class SnapshotStore:
             self._client = boto3.client("s3")
         return self._client
 
-    def _load_file(self, graph: Any) -> bool:
-        if not os.path.exists(self.path):
-            logger.info("no snapshot at %s; starting with an empty graph", self.path)
+    def _load_file(self, graph: Any, path: str) -> bool:
+        if not os.path.exists(path):
+            logger.info("no snapshot at %s; starting with an empty graph", path)
             return False
-        graph.load_from_file(self.path)
-        logger.info("restored context graph from %s", self.path)
+        graph.load_from_file(path)
+        logger.info("restored context graph from %s", path)
         return True
 
-    def _save_file(self, graph: Any) -> None:
+    def _save_file(self, graph: Any, path: str) -> None:
         # save_to_file deliberately refuses to create the parent directory --
         # the library caller owns the location. Here the location is deployment
         # config and a freshly mounted volume legitimately starts empty, so a
         # missing directory is a first-run condition, not a permanent failure.
-        parent = os.path.dirname(os.path.abspath(self.path))
-        os.makedirs(parent, exist_ok=True)
-        graph.save_to_file(self.path)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        graph.save_to_file(path)
 
     def _load_object(self, graph: Any) -> bool:
         client = self._s3()
         try:
             response = client.get_object(Bucket=self.bucket, Key=self.key)
             body = response["Body"].read()
-        except self._absent_object_errors(client) as error:
+        # The tuple is assembled and checked by _absent_object_errors; mypy
+        # cannot verify a runtime-computed except clause.
+        except self._absent_object_errors(client) as error:  # type: ignore[misc]
             if not _is_absent_object(error):
                 # AccessDenied, NoSuchBucket, a throttle: raise. Reporting
                 # "no snapshot" here would start an empty graph and let the
@@ -180,21 +187,21 @@ class SnapshotStore:
 
     def _save_object(self, graph: Any) -> None:
         client = self._s3()
-        # ponytail: a temp-file round trip and a full read into memory per
-        # upload. Deliberate -- it keeps ONE serialiser, so the object is
-        # byte-identical to a local snapshot. Upgrade path: extract a payload
-        # seam out of save_to_file and stream it straight into put_object. Per
-        # HLD section 5 the serialisation cost, not the I/O, is the real bound,
-        # so this buys correctness against the cheaper half of the budget.
+        # ponytail: a temp-file round trip per upload. Deliberate -- it keeps
+        # ONE serialiser, so the object is byte-identical to a local snapshot.
+        # Upgrade path: extract a payload seam out of save_to_file and stream it
+        # straight into put_object. Per HLD section 5 the serialisation cost,
+        # not the I/O, is the real bound, so this buys correctness against the
+        # cheaper half of the budget.
         with tempfile.TemporaryDirectory() as staging:
             staged = os.path.join(staging, "snapshot.json")
             graph.save_to_file(staged)
+            # put_object streams a file object, so the payload is never held in
+            # memory a second time. save_to_file has already released the graph
+            # lock by here: an upload must not block every mutation for a
+            # network round trip.
             with open(staged, "rb") as handle:
-                body = handle.read()
-        # Outside the graph lock: save_to_file releases it once the payload is
-        # built, and an upload must not block every mutation for a network
-        # round trip.
-        client.put_object(Bucket=self.bucket, Key=self.key, Body=body)
+                client.put_object(Bucket=self.bucket, Key=self.key, Body=handle)
         logger.info("wrote context graph snapshot to %s", self.description)
 
     @staticmethod

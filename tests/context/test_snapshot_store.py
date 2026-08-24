@@ -37,11 +37,12 @@ try:
     import boto3
     from botocore.exceptions import ClientError
     from botocore.response import StreamingBody
-    from botocore.stub import Stubber
+    from botocore.stub import ANY, Stubber
 
     BOTO3_INSTALLED = True
 except (ImportError, OSError):  # pragma: no cover - exercised only without boto3
     BOTO3_INSTALLED = False
+    ANY = None
     boto3 = None
     ClientError = None
     StreamingBody = None
@@ -281,26 +282,50 @@ class TestS3Snapshots:
         """GIVEN a store built from ``s3://<bucket>/<key>``,
         WHEN a graph is saved,
         THEN ``put_object`` is called with exactly that bucket and key, and a
-        body byte-identical to the local snapshot of the same graph.
+        streamed body byte-identical to the local snapshot of the same graph.
 
-        Stubber fails the call if any parameter differs, so a hard-coded bucket
-        or key cannot pass here.
+        Stubber fails the call if the bucket or key differs, so a hard-coded one
+        cannot pass here. ``Body`` is matched as ``ANY`` because Stubber
+        compares parameters by value and the body is deliberately a file object
+        rather than bytes -- holding the whole serialised graph in memory a
+        second time is what the streaming exists to avoid. The payload is
+        instead read off that object in a ``before-parameter-build`` handler,
+        which proves both properties at once: it is file-like, and it carries
+        the right bytes.
         """
         graph = _seeded_graph(4, "s3-save")
         expected_body = _snapshot_bytes(graph, tmp_path / "reference.json")
         client = _s3_client()
         store = snapshot.SnapshotStore(URI, client=client)
+        streamed = {}
+
+        def capture(params, **_kwargs):
+            body = params["Body"]
+            streamed["is_file_like"] = hasattr(body, "read")
+            streamed["bytes"] = body.read()
+            body.seek(0)  # leave it as botocore found it
+
+        client.meta.events.register("before-parameter-build.s3.PutObject", capture)
 
         with Stubber(client) as stubber:
             stubber.add_response(
                 "put_object",
                 {},
-                {"Bucket": BUCKET, "Key": KEY, "Body": expected_body},
+                {"Bucket": BUCKET, "Key": KEY, "Body": ANY},
             )
 
             store.save(graph)
 
             stubber.assert_no_pending_responses()
+
+        assert streamed.get("is_file_like"), (
+            "Body was passed as bytes, so the entire serialised graph is held in "
+            "memory a second time on every 30-second snapshot"
+        )
+        assert streamed["bytes"] == expected_body, (
+            "the uploaded payload differs from the local snapshot of the same "
+            "graph, so the two destinations are no longer one serialiser"
+        )
 
     def test_load_round_trips_nodes_and_edges(self, tmp_path):
         """GIVEN an object holding a snapshot,
