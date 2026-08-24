@@ -1,10 +1,20 @@
+import importlib.metadata
+import importlib.util
 import sys
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, NonCallableMock
 
-# --- Mock missing cloud modules ---
-# We must mock these BEFORE importing the file_ingestor module
-# and we must populate the attributes that the code tries to import/patch.
+# --- Stand-in modules for cloud SDKs that may not be installed ---
+# These must exist BEFORE importing file_ingestor, carrying the attributes the
+# code under test imports and the tests patch.
+#
+# Availability is decided by find_spec, NOT by sys.modules membership: an
+# installed-but-not-yet-imported package is absent from sys.modules, so that
+# check would fabricate a stub shadowing the real SDK for the rest of the
+# pytest process. A genuinely installed package is left entirely untouched --
+# neither replaced nor given a MagicMock attribute -- because there is no
+# teardown here, and later tests that need the real client would silently get a
+# mock instead (see test_installed_cloud_sdks_are_not_mocked).
 
 module_names = [
     "boto3",
@@ -16,15 +26,31 @@ module_names = [
     "azure.storage.blob",
 ]
 
-for name in module_names:
-    if name not in sys.modules:
-        mod = types.ModuleType(name)
-        sys.modules[name] = mod
+# Attached only to modules we stand in for.
+# module name -> (attribute the code under test needs, providing distribution)
+cloud_stubs = {
+    "boto3": ("client", "boto3"),
+    "google.cloud.storage": ("Client", "google-cloud-storage"),
+    "azure.storage.blob": ("BlobServiceClient", "azure-storage-blob"),
+}
 
-# Explicitly add the classes that will be patched/used
-sys.modules["google.cloud.storage"].Client = MagicMock()
-sys.modules["azure.storage.blob"].BlobServiceClient = MagicMock()
-sys.modules["boto3"].client = MagicMock()
+
+def _is_installed(name: str) -> bool:
+    """Whether ``name`` resolves to a real package, imported or not."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        # Parent absent, a stub parent that is not a package, or a stub
+        # already in sys.modules with no __spec__.
+        return False
+
+
+for name in module_names:
+    if _is_installed(name):
+        continue
+    sys.modules.setdefault(name, types.ModuleType(name))
+    if name in cloud_stubs:
+        setattr(sys.modules[name], cloud_stubs[name][0], MagicMock())
 
 from pathlib import Path  # noqa: E402
 from unittest.mock import patch  # noqa: E402
@@ -324,3 +350,37 @@ def test_scan_directory_filters(temp_files: Path) -> None:
 
     assert len(res_max) == 1  # Expect latin.txt
     assert len(res_min) >= 3
+
+
+# --- Guard: importing this module must not mock an installed SDK ---
+@pytest.mark.parametrize(
+    "module_name,spec",
+    sorted(cloud_stubs.items()),
+)
+def test_installed_cloud_sdks_are_not_mocked(module_name, spec) -> None:
+    """An installed SDK must survive this module's import untouched.
+
+    The stubs at the top of this file have no teardown, so shadowing a real
+    module or mocking one of its attributes leaks into every later test in the
+    process -- botocore's Stubber, for one, needs a genuine boto3 client and
+    dies on a MagicMock. Keyed off the installed distribution rather than
+    sys.modules, so a stub that shadows the real package fails here instead of
+    quietly skipping.
+    """
+
+    attr, distribution = spec
+    try:
+        importlib.metadata.distribution(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("{} is not installed".format(distribution))
+
+    module = importlib.import_module(module_name)
+    assert module.__spec__ is not None, "{} was shadowed by a stub module".format(
+        module_name
+    )
+
+    target = getattr(module, attr)
+    assert not isinstance(target, NonCallableMock), "{}.{} was replaced by {!r}".format(
+        module_name, attr, target
+    )
+    assert callable(target)
