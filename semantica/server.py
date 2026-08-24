@@ -81,6 +81,8 @@ async def lifespan(app: FastAPI):
     yield
 
     logging.info("Shutting down Semantica API...")
+    # Before the close below: a final snapshot needs a live graph to read.
+    snapshots.stop()
     if getattr(app.state, "session", None) and hasattr(app.state.session.graph, "close"):
         app.state.session.graph.close()
 

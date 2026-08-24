@@ -129,6 +129,9 @@ def create_app(
         # but the restore has to run before the writer can mark anything dirty.
         snapshots.start()
         yield
+        # Stops the writer and takes a final snapshot if the graph is dirty,
+        # which is what makes an ordinary redeployment lossless.
+        snapshots.stop()
 
     app = FastAPI(
         title="Semantica Knowledge Explorer",

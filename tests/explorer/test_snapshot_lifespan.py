@@ -12,9 +12,12 @@ Starlette never runs the lifespan and the assertions would be hollow.
 
 import importlib
 import json
+import os
+import threading
 
 import pytest
 
+from semantica.context import snapshot as snapshot_module
 from semantica.context.context_graph import ContextGraph
 from semantica.context.snapshot import SNAPSHOT_URI_ENV, SnapshotStore
 from semantica.explorer.app import create_app
@@ -39,6 +42,15 @@ def _snapshot_on_disk(tmp_path, node_id="restored_node"):
     path = str(tmp_path / "snapshot.json")
     SnapshotStore(path).save(source)
     return path
+
+
+def _writer_threads():
+    """Live snapshot writer threads, by the name ``start()`` gives them."""
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "semantica-snapshot-writer" and thread.is_alive()
+    ]
 
 
 def _explorer_app():
@@ -201,3 +213,136 @@ class TestServerRestore:
         with pytest.raises(json.JSONDecodeError):
             with TestClient(_server_app()):
                 pass
+
+
+def _node_ids(path):
+    """Node ids in the snapshot at *path*."""
+    graph = ContextGraph(advanced_analytics=False)
+    graph.load_from_file(path)
+    return set(graph.nodes)
+
+
+class TestShutdownSnapshot:
+    """A redeployment must be lossless even inside one interval.
+
+    The interval is patched far beyond the life of each test, so any snapshot
+    these assert on can only have come from the shutdown path.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _never_tick(self, monkeypatch):
+        monkeypatch.setattr(snapshot_module, "snapshot_interval_from_env", lambda: 3600)
+
+    def test_explorer_writes_edits_made_after_the_last_tick(
+        self, tmp_path, monkeypatch
+    ):
+        """GIVEN edits and no interval tick
+        WHEN the Explorer app shuts down
+        THEN the snapshot on disk holds them.
+        """
+        path = str(tmp_path / "snapshot.json")
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, path)
+        app = _explorer_app()
+
+        with TestClient(app):
+            app.state.session.graph.add_node(
+                "shutdown_node", node_type="concept", content="Added while running"
+            )
+
+        assert _node_ids(path) == {"shutdown_node"}
+
+    def test_server_writes_edits_made_after_the_last_tick(self, tmp_path, monkeypatch):
+        """GIVEN edits and no interval tick
+        WHEN semantica.server shuts down
+        THEN the snapshot on disk holds them.
+        """
+        path = str(tmp_path / "snapshot.json")
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, path)
+        app = _server_app()
+
+        with TestClient(app):
+            app.state.session.graph.add_node(
+                "shutdown_node", node_type="concept", content="Added while running"
+            )
+
+        assert _node_ids(path) == {"shutdown_node"}
+
+    def test_a_clean_explorer_graph_is_not_rewritten(self, tmp_path, monkeypatch):
+        """GIVEN a restored graph nothing edited
+        WHEN the Explorer app shuts down
+        THEN the snapshot is left untouched rather than redundantly rewritten.
+        """
+        path = _snapshot_on_disk(tmp_path)
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, path)
+        before = os.stat(path).st_mtime_ns
+
+        with TestClient(_explorer_app()) as client:
+            assert client.get("/api/graph/nodes").json()["total"] == 2
+
+        assert os.stat(path).st_mtime_ns == before
+
+    def test_a_clean_server_graph_is_not_rewritten(self, tmp_path, monkeypatch):
+        """GIVEN a restored graph nothing edited
+        WHEN semantica.server shuts down
+        THEN the snapshot is left untouched rather than redundantly rewritten.
+        """
+        path = _snapshot_on_disk(tmp_path)
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, path)
+        before = os.stat(path).st_mtime_ns
+
+        with TestClient(_server_app()) as client:
+            assert client.get("/api/graph/nodes").json()["total"] == 2
+
+        assert os.stat(path).st_mtime_ns == before
+
+    def test_the_writer_thread_is_stopped_on_explorer_shutdown(
+        self, tmp_path, monkeypatch
+    ):
+        """GIVEN the Explorer app running with an interval writer
+        WHEN it shuts down
+        THEN no snapshot writer thread is left running.
+        """
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, str(tmp_path / "snapshot.json"))
+
+        with TestClient(_explorer_app()):
+            assert _writer_threads(), "expected a writer thread while running"
+
+        assert _writer_threads() == []
+
+    def test_the_writer_thread_is_stopped_on_server_shutdown(
+        self, tmp_path, monkeypatch
+    ):
+        """GIVEN semantica.server running with an interval writer
+        WHEN it shuts down
+        THEN no snapshot writer thread is left running.
+        """
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, str(tmp_path / "snapshot.json"))
+
+        with TestClient(_server_app()):
+            assert _writer_threads(), "expected a writer thread while running"
+
+        assert _writer_threads() == []
+
+    def test_a_failing_final_write_does_not_break_explorer_shutdown(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """GIVEN a destination that cannot be written
+        WHEN the Explorer app shuts down with a dirty graph
+        THEN shutdown completes and the failure is logged at ERROR.
+        """
+        unwritable = tmp_path / "unwritable"
+        unwritable.mkdir()
+        unwritable.chmod(0o500)
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, str(unwritable / "snapshot.json"))
+        app = _explorer_app()
+
+        try:
+            with caplog.at_level("ERROR"):
+                with TestClient(app):
+                    app.state.session.graph.add_node(
+                        "doomed", node_type="concept", content="Never stored"
+                    )
+        finally:
+            unwritable.chmod(0o700)
+
+        assert "snapshot to" in caplog.text

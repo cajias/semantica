@@ -372,19 +372,29 @@ class SnapshotService:
         return self
 
     def stop(self) -> None:
-        """Stop the interval writer and wait for a tick in flight to finish."""
+        """Stop the interval writer, then take a final snapshot if one is due.
+
+        The platform signals a container before stopping it, and this is that
+        chance: it is what makes an ordinary redeployment lossless, including
+        for a container that never lived a full interval. The write is still
+        gated on the dirty flag -- a clean graph already matches what is
+        stored, so writing again would be pure I/O on every redeploy.
+        """
         self._stop.set()
         thread = self._thread
-        if thread is None:
-            return
-        # Bounded: the wait() returns at once, but a save already under way is
-        # a network round trip, and a shutdown grace period is finite.
-        thread.join(timeout=STOP_JOIN_TIMEOUT)
-        if thread.is_alive():
-            logger.warning(
-                "snapshot writer did not stop within %ss", STOP_JOIN_TIMEOUT
-            )
-        self._thread = None
+        if thread is not None:
+            # Bounded: the wait() returns at once, but a save already under way
+            # is a network round trip, and a shutdown grace period is finite.
+            thread.join(timeout=STOP_JOIN_TIMEOUT)
+            if thread.is_alive():
+                logger.warning(
+                    "snapshot writer did not stop within %ss", STOP_JOIN_TIMEOUT
+                )
+            self._thread = None
+        # snapshot_if_dirty logs a failure at ERROR and returns rather than
+        # raising: an exception here would escape into the lifespan's teardown
+        # and mask whatever else was shutting down.
+        self.snapshot_if_dirty()
 
     def _mark_dirty_on_mutation(self) -> None:
         """Chain a dirty-flag setter onto the graph's mutation callback.

@@ -68,11 +68,13 @@ class TestMutationHook:
         service = _started(graph, store, monkeypatch, interval=3600)
         try:
             _add(graph, "alpha")
+            # Read before stop(), which takes a final snapshot and clears it.
+            dirty = service._dirty
         finally:
             service.stop()
 
         assert seen == ["ADD_NODE"]
-        assert service._dirty is True
+        assert dirty is True
 
     def test_installing_twice_calls_the_previous_callback_once(self, monkeypatch):
         """GIVEN a mutation callback already installed on the graph
@@ -88,13 +90,15 @@ class TestMutationHook:
 
         try:
             _add(graph, "alpha")
+            # Read before stop(), which takes a final snapshot and clears them.
+            first_dirty, second_dirty = first._dirty, second._dirty
         finally:
             first.stop()
             second.stop()
 
         assert seen == ["ADD_NODE"]
-        assert first._dirty is True
-        assert second._dirty is False
+        assert first_dirty is True
+        assert second_dirty is False
 
     def test_no_hook_and_no_thread_when_persistence_is_off(self):
         """GIVEN no snapshot destination configured
@@ -278,3 +282,83 @@ class TestThreadBehaviour:
             service.stop()
 
         assert acquired is True
+
+
+class TestShutdown:
+    def test_a_dirty_graph_is_snapshotted_on_stop(self, monkeypatch):
+        """GIVEN mutations and an interval far longer than the process lived
+        WHEN the service is stopped
+        THEN a final snapshot holding them is written.
+        """
+        graph = _graph()
+        store = FakeStore()
+        service = _started(graph, store, monkeypatch, interval=3600)
+
+        _add(graph, "alpha")
+        _add(graph, "beta")
+        service.stop()
+
+        assert store.saves == 1
+        assert store.saved_node_counts == [2]
+
+    def test_a_clean_graph_is_not_snapshotted_on_stop(self, monkeypatch):
+        """GIVEN a graph unchanged since its last snapshot
+        WHEN the service is stopped
+        THEN nothing is written -- the stored snapshot already matches.
+        """
+        graph = _graph()
+        store = FakeStore()
+        service = _started(graph, store, monkeypatch, interval=3600)
+
+        _add(graph, "alpha")
+        service.snapshot_if_dirty()
+        service.stop()
+
+        assert store.saves == 1
+
+    def test_stop_without_a_started_thread_still_snapshots(self, monkeypatch):
+        """GIVEN a service that was never started
+        WHEN it is stopped
+        THEN a dirty graph is still snapshotted, and no thread is touched.
+        """
+        graph = _graph()
+        store = FakeStore()
+        monkeypatch.setattr(snapshot_module, "snapshot_interval_from_env", lambda: 3600)
+        service = SnapshotService(graph, store)
+        service._dirty = True
+
+        service.stop()
+
+        assert store.saves == 1
+        assert service._thread is None
+
+    def test_a_failing_final_snapshot_does_not_break_shutdown(
+        self, monkeypatch, caplog
+    ):
+        """GIVEN a store whose save raises
+        WHEN the service is stopped
+        THEN stop() returns normally and the failure is logged at ERROR.
+        """
+        graph = _graph()
+        store = FakeStore(error=RuntimeError("bucket went away"))
+        service = _started(graph, store, monkeypatch, interval=3600)
+        thread = service._thread
+
+        _add(graph, "alpha")
+        with caplog.at_level("ERROR"):
+            service.stop()
+
+        assert "bucket went away" in caplog.text
+        assert thread is not None and not thread.is_alive()
+
+    def test_stop_is_a_no_op_when_persistence_is_off(self):
+        """GIVEN no snapshot destination configured
+        WHEN the service is stopped
+        THEN nothing happens and nothing raises.
+        """
+        service = SnapshotService(_graph(), None)
+        service.start()
+
+        service.stop()
+
+        assert service._thread is None
