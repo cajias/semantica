@@ -8,7 +8,7 @@ an unparseable one, and ``load_from_file`` tolerates a *missing* file but not a
 malformed one -- it raises ``json.JSONDecodeError``. A half-written snapshot is
 not a degraded snapshot, it is a dead one.
 
-Failures below are forced deterministically by monkeypatching ``json.dumps`` and
+Failures below are forced deterministically by monkeypatching ``json.dump`` and
 ``os.replace``, not by racing threads or killing processes: a snapshot-integrity
 test that only fails sometimes is not a test.
 """
@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from semantica.context._atomic_write import _DEFAULT_FILE_MODE
 from semantica.context.context_graph import ContextGraph
 
 
@@ -42,18 +43,27 @@ def _boom(*_args, **_kwargs):
 class TestFailedSaveLeavesTheOldSnapshotIntact:
     """The core guarantee: a failed save must not destroy a good snapshot."""
 
-    def test_previous_snapshot_survives_a_serialisation_failure(
+    def test_previous_snapshot_survives_a_failure_mid_write(
         self, tmp_path, monkeypatch
     ):
         """GIVEN a good snapshot already on disk,
-        WHEN a later ``save_to_file`` to the same path fails while serialising,
-        THEN the file on disk is still the original, loadable snapshot.
+        WHEN a later save raises part-way through writing, after real bytes have
+        reached the open file,
+        THEN the destination still holds the original, loadable snapshot and no
+        temporary file is left behind.
+
+        The caller raises inside the ``atomic_replace`` block, so this is also
+        the proof that an exception from the body skips the replace.
         """
         path = tmp_path / "graph.json"
         _seeded_graph(3, "original").save_to_file(str(path))
         good_bytes = path.read_bytes()
 
-        monkeypatch.setattr(json, "dumps", _boom)
+        def dump_partially_then_fail(_data, fp, **_kwargs):
+            fp.write('{"graph_id": "half-written", "nodes": [{"id": "n0"')
+            raise RuntimeError("simulated failure during save")
+
+        monkeypatch.setattr(json, "dump", dump_partially_then_fail)
         with pytest.raises(RuntimeError):
             _seeded_graph(5, "replacement").save_to_file(str(path))
         monkeypatch.undo()
@@ -62,10 +72,36 @@ class TestFailedSaveLeavesTheOldSnapshotIntact:
             "the failed save overwrote the destination -- the previous "
             "snapshot has been destroyed by a save that did not even succeed"
         )
+        listing = sorted(os.listdir(str(tmp_path)))
+        assert listing == ["graph.json"], f"a failed write leaked a temp: {listing}"
         reloaded = ContextGraph(advanced_analytics=False)
         reloaded.load_from_file(str(path))
         assert reloaded.graph_id == "original"
         assert sorted(reloaded.nodes) == ["n0", "n1", "n2"]
+
+    def test_payload_is_streamed_into_the_temp_file(self, tmp_path, monkeypatch):
+        """GIVEN a save,
+        THEN the payload is written straight into the open temp file rather than
+        materialised as one big string first, so peak memory stays flat.
+        """
+        path = tmp_path / "graph.json"
+        real_dump = json.dump
+        targets = []
+
+        def record_dump(data, fp, **kwargs):
+            targets.append(getattr(fp, "name", None))
+            return real_dump(data, fp, **kwargs)
+
+        monkeypatch.setattr(json, "dump", record_dump)
+        _seeded_graph().save_to_file(str(path))
+        monkeypatch.undo()
+
+        assert targets, (
+            "json.dump was never called -- the payload is being serialised to a "
+            "string first, which doubles peak memory for a large snapshot"
+        )
+        assert targets[0] != str(path), "json.dump wrote to the destination directly"
+        assert str(tmp_path) in targets[0]
 
     def test_previous_snapshot_survives_a_failed_replace(self, tmp_path, monkeypatch):
         """GIVEN a good snapshot already on disk,
@@ -239,17 +275,16 @@ class TestSnapshotPermissions:
         THEN the new snapshot gets the umask-derived mode a plain open() would
         have produced, rather than tempfile's owner-only 0600.
         """
-        umask = os.umask(0)
-        os.umask(umask)
         path = tmp_path / "graph.json"
 
         _seeded_graph().save_to_file(str(path))
 
         mode = stat.S_IMODE(os.stat(str(path)).st_mode)
-        assert mode == 0o666 & ~umask, (
-            f"new snapshot is {oct(mode)}, not the {oct(0o666 & ~umask)} a "
+        assert mode == _DEFAULT_FILE_MODE, (
+            f"new snapshot is {oct(mode)}, not the {oct(_DEFAULT_FILE_MODE)} a "
             "plain open() would have created under this umask"
         )
+        assert _DEFAULT_FILE_MODE & 0o600, "the writer cannot read back its own file"
 
     def test_setgid_is_not_propagated(self, tmp_path):
         """GIVEN an existing snapshot carrying setgid,

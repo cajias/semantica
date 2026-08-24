@@ -118,7 +118,7 @@ from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
 from ..utils.helpers import classify_path_distance
 from ..utils.skos import is_skos_hierarchy_edge, validate_skos_hierarchy
-from ._atomic_write import atomic_write_text
+from ._atomic_write import atomic_replace
 from .entity_linker import EntityLinker
 
 # Optional imports for advanced features
@@ -1139,18 +1139,8 @@ class ContextGraph:
         # os.replace swaps the final path component, so resolve symlinks first
         # to keep writing *through* a symlinked snapshot path the way
         # open(path, "w") did instead of replacing the link with a regular file.
-        target = os.path.realpath(path)
-        is_new = not os.path.exists(target)
-        atomic_write_text(target, json.dumps(data, indent=2, ensure_ascii=False))
-
-        if is_new:
-            # tempfile creates at 0600; restore the umask-derived mode a plain
-            # open() gave a new file. ponytail: os.umask(0) is not thread-safe --
-            # a file created by another thread inside this window gets 0666.
-            # Upgrade if that bites: read Umask from /proc/self/status on Linux.
-            umask = os.umask(0)
-            os.umask(umask)
-            os.chmod(target, 0o666 & ~umask)
+        with atomic_replace(os.path.realpath(path)) as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
 
         self.logger.info(f"Saved context graph to {path}")
 
