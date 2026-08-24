@@ -146,11 +146,17 @@ python -c "import semantica; print(semantica.__version__)"
 | `SEMANTICA_KG_PATH` | *(none)* | Path to a saved graph file to load on startup |
 | `SEMANTICA_LOG_LEVEL` | `WARNING` | Log verbosity: `DEBUG`, `INFO`, `WARNING` |
 
-`semantica-server` reads one:
+`semantica-server` and `semantica-explorer` resolve their CORS configuration from
+the same two variables, so both commands behave identically:
 
 | Variable | Default | Description |
 | :-------- | :------- | :----------- |
-| `SEMANTICA_CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated list of allowed CORS origins |
+| `SEMANTICA_CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated browser origins allowed to call the API. **Set this to the deployment's own domain in production** — the default names local addresses only, so a deployment left at the default refuses every request from its real site. Deprecated aliases `ALLOWED_ORIGINS` then `EXPLORER_CORS_ORIGINS` are still honoured at lower precedence, with a warning. |
+| `SEMANTICA_CORS_CREDENTIALS` | `false` | Set to `true` to allow credentialed cross-origin requests. Not needed for `X-API-Key` authentication, which is an ordinary header — only for a reverse proxy that injects cookie-based auth. Deprecated alias: `EXPLORER_CORS_CREDENTIALS`. |
+
+Setting `SEMANTICA_CORS_ORIGINS` to `*` is honoured but warned about, and if
+credentials are also enabled the credentials are dropped: that pairing makes
+every site an allowed origin rather than being refused by the browser.
 
 No other environment variables are read by these commands.
 

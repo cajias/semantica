@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The two entry points honoured different environment variables for CORS origins, so configuring the wrong one silently left a production deployment on localhost-only CORS**
+  - `semantica/server.py` read `SEMANTICA_CORS_ORIGINS`; `semantica/explorer/app.py` read `ALLOWED_ORIGINS`, falling back to `EXPLORER_CORS_ORIGINS`. Every default named local addresses, so an operator who set the name the *other* entry point honoured got the development default and no log line saying why the browser refused every request. The Dockerfile bakes `ALLOWED_ORIGINS`, so the image honoured a name `semantica-server` ignored entirely
+  - New `semantica/utils/cors.py` is now the only reader of those names, called by both entry points. `SEMANTICA_CORS_ORIGINS` is canonical — it matches the namespace `SEMANTICA_API_KEY` / `SEMANTICA_ALLOW_ANONYMOUS` / `SEMANTICA_SNAPSHOT_URI` already use, where an unprefixed `ALLOWED_ORIGINS` is a name a co-located process or platform-injected ConfigMap can occupy by accident. Precedence, highest first: `SEMANTICA_CORS_ORIGINS`, `ALLOWED_ORIGINS`, `EXPLORER_CORS_ORIGINS`, then the unchanged localhost default. Both older names keep working — every shipped `deploy/` manifest, `docker-compose*.yml` and the `Dockerfile` are untouched and continue to work as before — and each logs a warning naming its replacement
+  - The canonical name deliberately outranks the others: the image bakes `ALLOWED_ORIGINS` into its own `ENV`, so a container always has it set, and were it to win then setting `SEMANTICA_CORS_ORIGINS` on a container would do nothing at all
+  - `server.py` passed `allow_credentials=True` unconditionally while sharing the same origins list, making it strictly more permissive than the Explorer for identical configuration. Both now read `SEMANTICA_CORS_CREDENTIALS` (deprecated alias `EXPLORER_CORS_CREDENTIALS`), default `false`. Credentials are not needed for the `X-API-Key` scheme, which is an ordinary header
+  - `*` is honoured but warned about, and `*` combined with credentials now drops the credentials: Starlette does not refuse that pair, it answers it by reflecting the request's own `Origin` alongside `Access-Control-Allow-Credentials: true` — turning "wildcard, therefore no credentials" into "every site may make credentialed requests"
+  - `tests/explorer/test_cors_settings.py` (36 tests) covers precedence for every supported pair, the deprecation warnings, the silence of the unconfigured default, whitespace/empty-entry parsing, and the `*` cases. Its drift guard compares the CORS options both applications actually install across seven environments and patches the shared resolver to prove both call it, so re-implementing the precedence rules per entry point fails the suite
+  - Docs: `docs/cli-setup.md`, `docs/reference/explorer.md` and `explorer/README.md` now name the canonical variables and say to set them to the deployment's real domain
+
 ## [0.6.6] - 2026-08-20
 
 ### Added

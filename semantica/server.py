@@ -20,6 +20,7 @@ from typing import List, Optional, Dict, Any
 from . import __version__
 from .context.snapshot import SnapshotService
 from .core.orchestrator import Semantica
+from .utils import cors
 from .utils.logging import setup_logging
 
 try:
@@ -95,16 +96,14 @@ app = FastAPI(
 )
 
 # --- CORS -----------------------------------------------------------
-# Allow origins from environment (comma-separated); defaults to
-# localhost only so production deployments must configure this.
-_cors_origins_env = os.environ.get(
-    "SEMANTICA_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
-)
-_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+# Resolved by semantica.utils.cors, which semantica/explorer/app.py also calls,
+# so the two entry points cannot honour different environment variable names.
+# Defaults to localhost only, so production must set SEMANTICA_CORS_ORIGINS.
+_cors = cors.resolve_cors_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_origins=_cors.origins,
+    allow_credentials=_cors.allow_credentials,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
     max_age=600,

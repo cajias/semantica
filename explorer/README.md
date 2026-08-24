@@ -148,8 +148,8 @@ This writes the compiled assets to `../semantica/static/`. The Python server the
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `EXPLORER_CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated list of allowed CORS origins |
-| `EXPLORER_CORS_CREDENTIALS` | `false` | Set to `true` to allow credentialed cross-origin requests (only needed behind an authenticating reverse proxy) |
+| `SEMANTICA_CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated list of allowed CORS origins. Set to the deployment's real domain in production. Deprecated aliases, still honoured at lower precedence: `ALLOWED_ORIGINS`, then `EXPLORER_CORS_ORIGINS`. |
+| `SEMANTICA_CORS_CREDENTIALS` | `false` | Set to `true` to allow credentialed cross-origin requests (only needed behind an authenticating reverse proxy). Deprecated alias: `EXPLORER_CORS_CREDENTIALS`. |
 | `SEMANTICA_API_KEY` | *(unset)* | API key required on protected routes since v0.6.5; send it as the `X-API-Key` header. When unset, protected routes fail closed with `503`. |
 | `SEMANTICA_ALLOW_ANONYMOUS` | `false` | Set to `true` to opt into unauthenticated access (local development only). |
 

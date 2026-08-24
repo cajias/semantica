@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from .. import __version__
 from ..context.context_graph import ContextGraph
 from ..context.snapshot import SnapshotService
+from ..utils import cors
 from .dependencies import anonymous_access_allowed, get_expected_api_key, is_valid_api_key, require_auth
 from .session import GraphSession
 from .ws import ConnectionManager
@@ -32,16 +33,12 @@ def _read_int_env(name: str, default: int) -> int:
 
 
 def _read_explorer_settings() -> dict:
-    if "ALLOWED_ORIGINS" in os.environ:
-        raw_origins = os.environ["ALLOWED_ORIGINS"]
-    elif "EXPLORER_CORS_ORIGINS" in os.environ:
-        raw_origins = os.environ["EXPLORER_CORS_ORIGINS"]
-    else:
-        raw_origins = "http://localhost:5173,http://127.0.0.1:5173"
+    # Resolved by semantica.utils.cors, which semantica/server.py also calls, so
+    # the two entry points cannot honour different environment variable names.
+    cors_settings = cors.resolve_cors_settings()
     return {
-        "allowed_origins": [
-            origin.strip() for origin in raw_origins.split(",") if origin.strip()
-        ],
+        "allowed_origins": cors_settings.origins,
+        "allow_credentials": cors_settings.allow_credentials,
         # These are read and stored for future use when direct FalkorDB connection
         # support is added to the Explorer. Currently GraphSession uses an in-memory
         # ContextGraph and does not open a network connection to FalkorDB.
@@ -145,13 +142,12 @@ def create_app(
     # allow_credentials lets browsers send cookies/auth headers cross-origin.
     # Credentials aren't needed for the X-API-Key auth scheme below, and
     # enabling them when origins are broadened creates cross-site request
-    # risk. Set EXPLORER_CORS_CREDENTIALS=true explicitly to opt in (e.g.
+    # risk. Set SEMANTICA_CORS_CREDENTIALS=true explicitly to opt in (e.g.
     # for a reverse-proxy setup that injects its own cookie-based auth).
-    _allow_credentials = os.environ.get("EXPLORER_CORS_CREDENTIALS", "false").lower() == "true"
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings["allowed_origins"],
-        allow_credentials=_allow_credentials,
+        allow_credentials=settings["allow_credentials"],
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "Authorization", "X-API-Key"],
         max_age=600,
