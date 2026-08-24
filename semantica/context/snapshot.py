@@ -1,0 +1,272 @@
+"""One-object snapshot store for a :class:`~semantica.context.ContextGraph`.
+
+The graph lives in memory, so durability is added around it rather than inside
+it: a single object key holding a single serialised graph, written to a local
+filesystem path or to S3. See ``docs/design/aws-integration/README.md`` section 5.
+
+Serialisation is not reimplemented here. ``ContextGraph.save_to_file`` /
+``load_from_file`` are the only pair that produce and consume the snapshot
+payload, so both destinations route through them and the S3 object is
+byte-identical to the local file.
+
+One asymmetry carries the whole design. *Absence* of a snapshot means "first ever
+deployment" and yields an empty graph. Every other failure -- a denied read, a
+missing bucket, a truncated payload -- raises, because starting empty after a
+permissions failure would let the next interval tick overwrite a perfectly good
+snapshot with an empty one. That is data loss disguised as a successful start-up.
+Section 6 of the same document has the application fail closed on
+misconfiguration; this is the same principle applied to storage.
+"""
+
+import contextlib
+import os
+import tempfile
+from typing import Any, Dict, Iterator, Optional, Tuple
+
+from ..utils.exceptions import ProcessingError, ValidationError
+from ..utils.logging import get_logger
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+
+    BOTO3_AVAILABLE = True
+except (ImportError, OSError):  # native wheels fail with OSError, not ImportError
+    BOTO3_AVAILABLE = False
+    boto3 = None
+    ClientError = None
+
+SNAPSHOT_URI_ENV = "SEMANTICA_SNAPSHOT_URI"
+SNAPSHOT_INTERVAL_ENV = "SEMANTICA_SNAPSHOT_INTERVAL"
+DEFAULT_SNAPSHOT_INTERVAL = 30
+
+_S3_SCHEME = "s3://"
+# S3 answers a missing object with NoSuchKey, and a HeadObject-shaped 404 with
+# no code at all. NoSuchBucket is *also* a 404, so absence is decided on the
+# code, never on the status.
+_ABSENT_OBJECT_CODES = ("NoSuchKey", "404")
+
+logger = get_logger("context_snapshot")
+
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    """Split ``s3://<bucket>/<key>`` into its two halves."""
+    bucket, _, key = uri[len(_S3_SCHEME) :].partition("/")
+    if not bucket or not key.strip("/"):
+        raise ValidationError(
+            "{} must name a bucket and an object key, as s3://<bucket>/<key>; "
+            "got {!r}".format(SNAPSHOT_URI_ENV, uri)
+        )
+    return bucket, key
+
+
+def _is_absent_object(error: BaseException) -> bool:
+    """True when *error* means the snapshot object does not exist yet."""
+    response = getattr(error, "response", None)
+    if not isinstance(response, dict):
+        # A stub may raise a bare ``client.exceptions.NoSuchKey`` with no
+        # response payload attached.
+        return type(error).__name__ == "NoSuchKey"
+    code = response.get("Error", {}).get("Code")
+    return code in _ABSENT_OBJECT_CODES
+
+
+class SnapshotStore:
+    """Reads and writes one serialised graph at one destination.
+
+    The graph is a parameter, never a base class or a wrapped attribute:
+    ``decision_recorder`` and ``decision_query`` dispatch on ``type(x) is
+    ContextGraph``, so a subclass would be routed to their Cypher branch.
+    """
+
+    def __init__(self, uri: Optional[str], client: Optional[Any] = None):
+        """
+        Args:
+            uri: ``s3://<bucket>/<key>``, or any other value as a local path.
+            client: Pre-built S3 client, for tests. Built on first use otherwise.
+        """
+        if not uri or not uri.strip():
+            raise ValidationError(
+                "{} must be a non-empty path or s3:// URI; to disable "
+                "persistence, do not build a store at all".format(SNAPSHOT_URI_ENV)
+            )
+        self.uri = uri
+        self._client = client
+        if uri.startswith(_S3_SCHEME):
+            self.bucket, self.key = _parse_s3_uri(uri)
+            self.path = None  # type: Optional[str]
+        else:
+            self.bucket, self.key = None, None
+            self.path = uri
+
+    @property
+    def description(self) -> str:
+        """Destination as a start-up log line. Never includes a credential."""
+        if self.path is not None:
+            return "file {}".format(self.path)
+        return "s3://{}/{}".format(self.bucket, self.key)
+
+    def load(self, graph: Any) -> bool:
+        """Restore the snapshot into *graph*.
+
+        Returns:
+            True if a snapshot was restored, False if none existed yet.
+        """
+        if self.path is not None:
+            return self._load_file(graph)
+        return self._load_object(graph)
+
+    def save(self, graph: Any) -> None:
+        """Write *graph* to the destination, replacing whatever is there."""
+        if self.path is not None:
+            self._save_file(graph)
+        else:
+            self._save_object(graph)
+
+    def _s3(self) -> Any:
+        if self._client is None:
+            if not BOTO3_AVAILABLE:
+                raise ProcessingError(
+                    "S3 snapshots need boto3, an optional dependency: install "
+                    "semantica[cloud] (requested destination: {})".format(
+                        self.description
+                    )
+                )
+            self._client = boto3.client("s3")
+        return self._client
+
+    def _load_file(self, graph: Any) -> bool:
+        if not os.path.exists(self.path):
+            logger.info("no snapshot at %s; starting with an empty graph", self.path)
+            return False
+        graph.load_from_file(self.path)
+        logger.info("restored context graph from %s", self.path)
+        return True
+
+    def _save_file(self, graph: Any) -> None:
+        # save_to_file deliberately refuses to create the parent directory --
+        # the library caller owns the location. Here the location is deployment
+        # config and a freshly mounted volume legitimately starts empty, so a
+        # missing directory is a first-run condition, not a permanent failure.
+        parent = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(parent, exist_ok=True)
+        graph.save_to_file(self.path)
+
+    def _load_object(self, graph: Any) -> bool:
+        client = self._s3()
+        try:
+            response = client.get_object(Bucket=self.bucket, Key=self.key)
+            body = response["Body"].read()
+        except self._absent_object_errors(client) as error:
+            if not _is_absent_object(error):
+                # AccessDenied, NoSuchBucket, a throttle: raise. Reporting
+                # "no snapshot" here would start an empty graph and let the
+                # next interval tick replace a good object with an empty one.
+                raise
+            logger.info(
+                "no snapshot object at %s; starting with an empty graph",
+                self.description,
+            )
+            return False
+
+        with tempfile.TemporaryDirectory() as staging:
+            staged = os.path.join(staging, "snapshot.json")
+            with open(staged, "wb") as handle:
+                handle.write(body)
+            # A corrupt or truncated body raises out of here, deliberately.
+            graph.load_from_file(staged)
+        logger.info("restored context graph from %s", self.description)
+        return True
+
+    def _save_object(self, graph: Any) -> None:
+        client = self._s3()
+        # ponytail: a temp-file round trip and a full read into memory per
+        # upload. Deliberate -- it keeps ONE serialiser, so the object is
+        # byte-identical to a local snapshot. Upgrade path: extract a payload
+        # seam out of save_to_file and stream it straight into put_object. Per
+        # HLD section 5 the serialisation cost, not the I/O, is the real bound,
+        # so this buys correctness against the cheaper half of the budget.
+        with tempfile.TemporaryDirectory() as staging:
+            staged = os.path.join(staging, "snapshot.json")
+            graph.save_to_file(staged)
+            with open(staged, "rb") as handle:
+                body = handle.read()
+        # Outside the graph lock: save_to_file releases it once the payload is
+        # built, and an upload must not block every mutation for a network
+        # round trip.
+        client.put_object(Bucket=self.bucket, Key=self.key, Body=body)
+        logger.info("wrote context graph snapshot to %s", self.description)
+
+    @staticmethod
+    def _absent_object_errors(client: Any) -> Tuple[type, ...]:
+        """Exception types a missing object can arrive as.
+
+        ``client.exceptions.NoSuchKey`` is a ``ClientError`` subclass in
+        botocore, but a stub need not be, so both are named.
+        """
+        errors = []
+        no_such_key = getattr(getattr(client, "exceptions", None), "NoSuchKey", None)
+        if isinstance(no_such_key, type):
+            errors.append(no_such_key)
+        if ClientError is not None:
+            errors.append(ClientError)
+        return tuple(errors) or (OSError,)
+
+
+def snapshot_store_from_env(
+    env: Optional[Dict[str, str]] = None
+) -> Optional[SnapshotStore]:
+    """Build a store from ``SEMANTICA_SNAPSHOT_URI``, or None if it is unset."""
+    source = os.environ if env is None else env
+    uri = (source.get(SNAPSHOT_URI_ENV) or "").strip()
+    if not uri:
+        return None
+    return SnapshotStore(uri)
+
+
+def snapshot_interval_from_env(env: Optional[Dict[str, str]] = None) -> int:
+    """Seconds between snapshots, from ``SEMANTICA_SNAPSHOT_INTERVAL``.
+
+    An unusable value warns and falls back to the default rather than raising:
+    the interval is a tuning knob, and refusing to boot over it would trade a
+    slightly wrong snapshot cadence for a total outage.
+    """
+    source = os.environ if env is None else env
+    raw = (source.get(SNAPSHOT_INTERVAL_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_SNAPSHOT_INTERVAL
+    try:
+        seconds = int(raw)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        logger.warning(
+            "%s=%r is not a positive whole number of seconds; using %d",
+            SNAPSHOT_INTERVAL_ENV,
+            raw,
+            DEFAULT_SNAPSHOT_INTERVAL,
+        )
+        return DEFAULT_SNAPSHOT_INTERVAL
+    return seconds
+
+
+@contextlib.contextmanager
+def suspended_mutations(graph: Any) -> Iterator[None]:
+    """Silence *graph*'s mutation callback for the duration of the block.
+
+    ``load_from_file`` replays every node and edge through ``add_nodes`` /
+    ``add_edges``, which announce each one. A restore would therefore broadcast
+    the whole graph to connected browsers and mark the freshly loaded graph as
+    dirty.
+
+    ``ContextGraph._suspend_mutation_callback`` is a plain boolean flag despite
+    the name, not a context manager. This is the shared form of the save/set/
+    restore that ``change_management/managers.py`` writes out by hand. The
+    *previous* value is restored, not False, so nesting works.
+    """
+    previous = getattr(graph, "_suspend_mutation_callback", False)
+    graph._suspend_mutation_callback = True
+    try:
+        yield
+    finally:
+        graph._suspend_mutation_callback = previous
