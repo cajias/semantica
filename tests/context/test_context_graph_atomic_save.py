@@ -23,6 +23,7 @@ test that only fails sometimes is not a test.
 
 import json
 import os
+import stat
 
 import pytest
 
@@ -239,6 +240,57 @@ class TestSuccessfulSave:
             "the destination holds more nodes than the last save wrote, so "
             "old content leaked through"
         )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
+class TestSnapshotPermissions:
+    """``os.replace`` carries the *source* file's mode onto the destination.
+
+    ``tempfile`` creates at 0600, so an atomic write silently demotes an
+    existing snapshot the operator or a sidecar reader depends on. Saving must
+    never narrow a mode the caller already chose.
+    """
+
+    def test_existing_mode_is_preserved(self, tmp_path):
+        """GIVEN a snapshot already on disk at mode 0644,
+        WHEN it is saved again,
+        THEN it is still 0644 -- a save does not revoke anyone's read access.
+        """
+        path = str(tmp_path / "graph.json")
+        _seeded_graph().save_to_file(path)
+        os.chmod(path, 0o644)
+
+        _seeded_graph(4).save_to_file(path)
+
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o644, (
+            f"saving demoted the snapshot from 0o644 to {oct(mode)}; readers "
+            "that relied on the operator's mode silently lose access"
+        )
+
+    def test_operator_chosen_group_mode_is_preserved(self, tmp_path):
+        """GIVEN a snapshot deliberately chmod'ed to 0640 by the operator,
+        THEN a later save keeps 0640 rather than imposing its own policy.
+        """
+        path = str(tmp_path / "graph.json")
+        _seeded_graph().save_to_file(path)
+        os.chmod(path, 0o640)
+
+        _seeded_graph(4).save_to_file(path)
+
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o640, f"expected 0o640 preserved, got {oct(mode)}"
+
+    def test_new_snapshot_is_owner_only(self, tmp_path):
+        """GIVEN no file at the destination,
+        THEN the created snapshot is 0600. There is no previous mode to honour,
+        and owner-only is the right default for a file holding the whole graph.
+        """
+        path = str(tmp_path / "graph.json")
+        _seeded_graph().save_to_file(path)
+
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600, f"new snapshot must be owner-only, got {oct(mode)}"
 
 
 class TestPreservedFailureModes:

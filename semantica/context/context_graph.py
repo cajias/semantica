@@ -1117,6 +1117,7 @@ class ContextGraph:
         """
         import json
         import os
+        import stat
         import tempfile
 
         with self._lock:
@@ -1160,6 +1161,15 @@ class ContextGraph:
                 json.dump(data, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
+            # os.replace carries the temp file's mode onto the destination and
+            # tempfile creates at 0600, so copy any existing mode across rather
+            # than silently narrowing a snapshot the operator chose. With no
+            # destination to honour, 0600 stands: owner-only is the right
+            # default for a file holding the whole graph.
+            try:
+                os.chmod(tmp.name, stat.S_IMODE(os.stat(path).st_mode))
+            except OSError:
+                pass  # no destination yet, or it vanished; keep 0600
             os.replace(tmp.name, path)
         except BaseException:
             try:
