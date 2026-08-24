@@ -118,6 +118,7 @@ from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
 from ..utils.helpers import classify_path_distance
 from ..utils.skos import is_skos_hierarchy_edge, validate_skos_hierarchy
+from ._atomic_write import atomic_write_text
 from .entity_linker import EntityLinker
 
 # Optional imports for advanced features
@@ -1105,20 +1106,15 @@ class ContextGraph:
         """
         Save context graph to file (JSON format).
 
-        The write is atomic: the payload is serialised to a temporary file in
-        the destination's own directory, then moved over the destination with
-        ``os.replace``. A reader therefore sees either the previous snapshot or
-        the new one, never a half-written file. Writing straight to ``path``
-        would truncate it before the first byte of the new payload landed, so a
-        failure part-way through serialisation destroyed a good snapshot.
+        Written atomically, because an in-place write truncated the destination
+        and so a failure part-way through destroyed a good snapshot. Needs write
+        permission on the destination's directory, not just on the file.
 
         Args:
             path: File path to save to
         """
         import json
         import os
-        import stat
-        import tempfile
 
         with self._lock:
     
@@ -1140,43 +1136,21 @@ class ContextGraph:
                 "links": links_data,
             }
 
-        # The temp file must share a filesystem with the destination or
-        # os.replace fails with EXDEV, hence dir= rather than /tmp. dirname of a
-        # bare filename is "", so abspath first.
-        # ponytail: the temp file is fsynced but its containing directory is
-        # not, so a power loss immediately after os.replace could still lose the
-        # rename itself. Upgrade path if that matters: os.open(directory,
-        # os.O_RDONLY) and os.fsync that fd after the replace.
-        directory = os.path.dirname(os.path.abspath(path))
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=directory,
-            prefix=".context_graph-",
-            suffix=".tmp",
-            delete=False,
-        )
-        try:
-            with tmp as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            # os.replace carries the temp file's mode onto the destination and
-            # tempfile creates at 0600, so copy any existing mode across rather
-            # than silently narrowing a snapshot the operator chose. With no
-            # destination to honour, 0600 stands: owner-only is the right
-            # default for a file holding the whole graph.
-            try:
-                os.chmod(tmp.name, stat.S_IMODE(os.stat(path).st_mode))
-            except OSError:
-                pass  # no destination yet, or it vanished; keep 0600
-            os.replace(tmp.name, path)
-        except BaseException:
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass  # already gone, or never created; keep the real error
-            raise
+        # os.replace swaps the final path component, so resolve symlinks first
+        # to keep writing *through* a symlinked snapshot path the way
+        # open(path, "w") did instead of replacing the link with a regular file.
+        target = os.path.realpath(path)
+        is_new = not os.path.exists(target)
+        atomic_write_text(target, json.dumps(data, indent=2, ensure_ascii=False))
+
+        if is_new:
+            # tempfile creates at 0600; restore the umask-derived mode a plain
+            # open() gave a new file. ponytail: os.umask(0) is not thread-safe --
+            # a file created by another thread inside this window gets 0666.
+            # Upgrade if that bites: read Umask from /proc/self/status on Linux.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(target, 0o666 & ~umask)
 
         self.logger.info(f"Saved context graph to {path}")
 

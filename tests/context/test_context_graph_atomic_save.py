@@ -1,29 +1,22 @@
 #!/usr/bin/env python3
 """Regression tests for atomic snapshot writes in ``ContextGraph.save_to_file``.
 
-``save_to_file`` builds its JSON payload under ``self._lock`` and then writes it
-out. The write used to be a plain ``open(path, "w")`` + ``json.dump``, which
-truncates the destination *before* a single byte of the new payload is written.
-Any failure part-way through serialisation -- an exception, a full disk, a
-crashed process -- therefore replaced a previously good snapshot with a
-truncated, unparseable file. ``load_from_file`` tolerates a *missing* file (it
-logs a warning and returns) but not a malformed one: it raises
-``json.JSONDecodeError``. So a half-written snapshot is not a degraded
-snapshot, it is a dead one.
+The write used to be a plain ``open(path, "w")`` + ``json.dump``, which
+truncates the destination before a single byte of the new payload is written.
+Any failure part-way through therefore replaced a previously good snapshot with
+an unparseable one, and ``load_from_file`` tolerates a *missing* file but not a
+malformed one -- it raises ``json.JSONDecodeError``. A half-written snapshot is
+not a degraded snapshot, it is a dead one.
 
-The fix serialises to a temporary file in the destination's own directory,
-fsyncs it, and then ``os.replace``s it over the destination. ``os.replace`` is
-atomic on POSIX and Windows, so a reader sees either the old snapshot or the
-new one -- never a partial one.
-
-The failures below are forced deterministically by monkeypatching
-``json.dump``, not by racing threads or killing processes: a snapshot-integrity
+Failures below are forced deterministically by monkeypatching ``json.dumps`` and
+``os.replace``, not by racing threads or killing processes: a snapshot-integrity
 test that only fails sometimes is not a test.
 """
 
 import json
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -41,73 +34,60 @@ def _seeded_graph(node_count: int = 3, graph_id: str = "ctx-atomic") -> ContextG
     return graph
 
 
-def _fail_after_partial_write(*_args, **_kwargs):
-    """Stand-in for ``json.dump`` that emits real bytes and then blows up.
-
-    Mirrors a disk filling up or a serialisation error on the last node: the
-    file handle has already received output, so whatever that handle points at
-    is now invalid JSON.
-    """
-    fp = _args[1]
-    fp.write('{"graph_id": "half-written", "nodes": [{"id": "n0"')
-    raise RuntimeError("simulated failure part-way through serialisation")
+def _boom(*_args, **_kwargs):
+    """Stand-in for a step that fails part-way through saving."""
+    raise RuntimeError("simulated failure during save")
 
 
 class TestFailedSaveLeavesTheOldSnapshotIntact:
     """The core guarantee: a failed save must not destroy a good snapshot."""
 
-    def test_previous_snapshot_survives_a_failed_save(self, tmp_path, monkeypatch):
+    def test_previous_snapshot_survives_a_serialisation_failure(
+        self, tmp_path, monkeypatch
+    ):
         """GIVEN a good snapshot already on disk,
-        WHEN a later ``save_to_file`` to the same path fails mid-serialisation,
+        WHEN a later ``save_to_file`` to the same path fails while serialising,
         THEN the file on disk is still the original, loadable snapshot.
         """
-        path = str(tmp_path / "graph.json")
-        _seeded_graph(3, "original").save_to_file(path)
-        good_bytes = open(path, "rb").read()
+        path = tmp_path / "graph.json"
+        _seeded_graph(3, "original").save_to_file(str(path))
+        good_bytes = path.read_bytes()
 
-        monkeypatch.setattr(json, "dump", _fail_after_partial_write)
+        monkeypatch.setattr(json, "dumps", _boom)
         with pytest.raises(RuntimeError):
-            _seeded_graph(5, "replacement").save_to_file(path)
+            _seeded_graph(5, "replacement").save_to_file(str(path))
+        monkeypatch.undo()
 
-        assert open(path, "rb").read() == good_bytes, (
+        assert path.read_bytes() == good_bytes, (
             "the failed save overwrote the destination -- the previous "
             "snapshot has been destroyed by a save that did not even succeed"
         )
-
-        monkeypatch.undo()
         reloaded = ContextGraph(advanced_analytics=False)
-        reloaded.load_from_file(path)
+        reloaded.load_from_file(str(path))
         assert reloaded.graph_id == "original"
-        assert sorted(reloaded.nodes) == ["n0", "n1", "n2"], (
-            "the surviving file parsed but does not describe the original "
-            "graph, so the destination was still modified"
-        )
+        assert sorted(reloaded.nodes) == ["n0", "n1", "n2"]
 
-    def test_a_failing_save_raises_to_the_caller(self, tmp_path, monkeypatch):
-        """GIVEN a save that cannot complete,
-        THEN the error propagates -- it is never swallowed into a silent
-        no-op that leaves the caller believing it persisted.
+    def test_previous_snapshot_survives_a_failed_replace(self, tmp_path, monkeypatch):
+        """GIVEN a good snapshot already on disk,
+        WHEN the ``os.replace`` that swaps the new payload in fails,
+        THEN the destination is untouched, the error propagates, and the fully
+        written temporary file is cleaned up rather than leaked.
+
+        This is the failure mode that reaches the write path with real bytes
+        already on disk, so it is what proves the temp-file cleanup runs.
         """
-        path = str(tmp_path / "graph.json")
-        monkeypatch.setattr(json, "dump", _fail_after_partial_write)
+        path = tmp_path / "graph.json"
+        _seeded_graph(3, "original").save_to_file(str(path))
+        good_bytes = path.read_bytes()
 
-        with pytest.raises(RuntimeError, match="part-way through serialisation"):
-            _seeded_graph().save_to_file(path)
-
-    def test_failed_save_leaves_no_files_behind(self, tmp_path, monkeypatch):
-        """GIVEN a failed save over an existing snapshot,
-        THEN the target directory contains exactly the destination file -- no
-        orphaned temporary file is left to accumulate on every failure.
-        """
-        path = str(tmp_path / "graph.json")
-        _seeded_graph().save_to_file(path)
-
-        monkeypatch.setattr(json, "dump", _fail_after_partial_write)
+        monkeypatch.setattr(os, "replace", _boom)
         with pytest.raises(RuntimeError):
-            _seeded_graph().save_to_file(path)
+            _seeded_graph(5, "replacement").save_to_file(str(path))
+        monkeypatch.undo()
 
+        assert path.read_bytes() == good_bytes, "a failed replace clobbered the target"
         assert sorted(os.listdir(str(tmp_path))) == ["graph.json"], (
-            "leftover files in the target directory after a failed save: "
+            "a failed os.replace leaked its temporary file: "
             f"{sorted(os.listdir(str(tmp_path)))}"
         )
 
@@ -119,32 +99,29 @@ class TestFailedSaveLeavesTheOldSnapshotIntact:
 
         A temporary file under ``tempfile.gettempdir()`` makes the final
         ``os.replace`` fail with ``OSError: Invalid cross-device link`` whenever
-        the destination is on a different filesystem -- which is the normal case
-        for a container volume or a mounted data disk. Asserted by listing the
-        directory from inside the serialisation step, so it holds regardless of
-        which ``tempfile`` API the implementation picks.
+        the destination is on another filesystem -- the normal case for a
+        container volume or mounted data disk. Observed by listing the directory
+        from inside ``os.replace``, so it holds whichever ``tempfile`` API the
+        implementation picks.
         """
         target_dir = tmp_path / "snapshots"
         target_dir.mkdir()
-        path = str(target_dir / "graph.json")
+        path = target_dir / "graph.json"
         seen = []
 
-        def dump_then_fail(*args, **kwargs):
-            # Appended as a single element so an empty listing still records
-            # that serialisation was reached.
+        def replace_then_fail(*args, **kwargs):
             seen.append(sorted(os.listdir(str(target_dir))))
-            return _fail_after_partial_write(*args, **kwargs)
+            raise RuntimeError("simulated failure during save")
 
-        monkeypatch.setattr(json, "dump", dump_then_fail)
+        monkeypatch.setattr(os, "replace", replace_then_fail)
         with pytest.raises(RuntimeError):
-            _seeded_graph().save_to_file(path)
+            _seeded_graph().save_to_file(str(path))
 
-        assert seen, "json.dump was never reached, so nothing was observed"
-        assert [name for name in seen[0] if name != "graph.json"], (
+        assert seen, "os.replace was never reached, so nothing was observed"
+        assert seen[0], (
             "no in-progress file was present in the destination directory "
-            f"during serialisation (saw {seen[0]}) -- the temporary file is "
-            "being created elsewhere, which breaks os.replace across "
-            "filesystems"
+            "before the replace -- the temporary file is being created "
+            "elsewhere, which breaks os.replace across filesystems"
         )
 
 
@@ -152,103 +129,92 @@ class TestSuccessfulSave:
     """The fix must not cost anything the plain write already delivered."""
 
     def test_round_trips_nodes_and_edges(self, tmp_path):
-        """GIVEN a saved graph,
+        """GIVEN a saved graph containing non-ASCII content,
         WHEN a fresh ``ContextGraph`` loads the file,
-        THEN nodes, edges and graph id come back, and no temporary file
-        remains next to the snapshot.
+        THEN nodes, edges and graph id come back, the raw file holds the
+        characters literally (``ensure_ascii=False`` preserved), and no
+        temporary file remains beside the snapshot.
         """
-        path = str(tmp_path / "graph.json")
+        path = tmp_path / "graph.json"
         original = _seeded_graph(4, "round-trip")
-        original.save_to_file(path)
+        original.add_node("uni", "entity", content="Zürich — 東京")
+        original.save_to_file(str(path))
 
         reloaded = ContextGraph(advanced_analytics=False)
-        reloaded.load_from_file(path)
+        reloaded.load_from_file(str(path))
 
         assert reloaded.graph_id == "round-trip"
         assert sorted(reloaded.nodes) == sorted(original.nodes)
         assert len(reloaded.edges) == len(original.edges)
-        assert sorted(os.listdir(str(tmp_path))) == ["graph.json"], (
-            "a temporary file survived a successful save: "
-            f"{sorted(os.listdir(str(tmp_path)))}"
-        )
+        assert reloaded.nodes["uni"].content == "Zürich — 東京"
+        assert "Zürich — 東京" in path.read_text(
+            encoding="utf-8"
+        ), "non-ASCII content was escaped; ensure_ascii=False must survive"
+        listing = sorted(os.listdir(str(tmp_path)))
+        assert listing == ["graph.json"], f"temp file survived a good save: {listing}"
 
-    def test_destination_is_never_observed_truncated(self, tmp_path, monkeypatch):
+    def test_destination_is_untouched_until_the_replace(self, tmp_path, monkeypatch):
         """GIVEN an existing snapshot,
         WHEN a new save runs to completion,
-        THEN the destination still held the *old* complete payload while the
-        new one was being serialised, and holds the complete new payload
-        afterwards. This is the ``os.replace`` guarantee: no window in which a
-        reader can see a truncated file.
+        THEN the destination still held the old complete payload at the instant
+        before ``os.replace`` ran, and holds the complete new payload after.
         """
-        path = str(tmp_path / "graph.json")
-        _seeded_graph(3, "before").save_to_file(path)
-        good_bytes = open(path, "rb").read()
+        path = tmp_path / "graph.json"
+        _seeded_graph(3, "before").save_to_file(str(path))
+        good_bytes = path.read_bytes()
 
-        real_dump = json.dump
-        mid_write = {}
+        real_replace = os.replace
+        peek = {}
 
-        def dump_and_peek(*args, **kwargs):
-            result = real_dump(*args, **kwargs)
-            mid_write["bytes"] = open(path, "rb").read()
-            return result
+        def replace_and_peek(*args, **kwargs):
+            peek["bytes"] = path.read_bytes()
+            return real_replace(*args, **kwargs)
 
-        monkeypatch.setattr(json, "dump", dump_and_peek)
-        _seeded_graph(6, "after").save_to_file(path)
+        monkeypatch.setattr(os, "replace", replace_and_peek)
+        _seeded_graph(6, "after").save_to_file(str(path))
         monkeypatch.undo()
 
-        assert mid_write["bytes"] == good_bytes, (
-            "the destination changed while the new payload was still being "
-            "serialised -- a concurrent reader could see a partial file"
+        assert peek["bytes"] == good_bytes, (
+            "the destination changed before the replace -- a concurrent reader "
+            "could see a partial file"
         )
-        payload = json.loads(open(path, encoding="utf-8").read())
+        payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload["graph_id"] == "after"
         assert len(payload["nodes"]) == 6
         assert len(payload["edges"]) == 5
 
-    def test_non_ascii_content_survives_unescaped(self, tmp_path):
-        """GIVEN a node whose content is non-ASCII,
-        THEN the raw file holds the characters literally, proving
-        ``ensure_ascii=False`` was preserved through the rewrite.
+    def test_symlinked_destination_is_written_through(self, tmp_path):
+        """GIVEN the destination is a symlink to a file in another directory,
+        WHEN the graph is saved to the link,
+        THEN the link still exists and its target holds the new payload.
+
+        ``os.replace`` acts on the final path component, so without resolving
+        the link first a save would destroy the symlink and leave the real
+        snapshot behind untouched -- where ``open(path, "w")`` wrote through it.
         """
-        path = str(tmp_path / "graph.json")
-        graph = ContextGraph(advanced_analytics=False)
-        graph.add_node("n0", "entity", content="Zürich — 東京 café")
-        graph.save_to_file(path)
+        real_dir = tmp_path / "snapshots"
+        real_dir.mkdir()
+        real_file = real_dir / "2026-08-24.json"
+        _seeded_graph(2, "old").save_to_file(str(real_file))
+        link = tmp_path / "current.json"
+        link.symlink_to(real_file)
 
-        raw = open(path, encoding="utf-8").read()
-        assert "Zürich — 東京 café" in raw, (
-            "non-ASCII content was escaped or mangled; ensure_ascii=False "
-            "and encoding='utf-8' must both survive"
-        )
+        _seeded_graph(5, "new").save_to_file(str(link))
 
-        reloaded = ContextGraph(advanced_analytics=False)
-        reloaded.load_from_file(path)
-        assert reloaded.nodes["n0"].content == "Zürich — 東京 café"
-
-    def test_existing_file_is_replaced_not_appended(self, tmp_path):
-        """GIVEN a destination path that already holds a larger snapshot,
-        THEN a successful save leaves exactly the new payload -- the old bytes
-        are gone rather than appended to or partially overwritten.
-        """
-        path = str(tmp_path / "graph.json")
-        _seeded_graph(20, "big").save_to_file(path)
-        _seeded_graph(2, "small").save_to_file(path)
-
-        payload = json.loads(open(path, encoding="utf-8").read())
-        assert payload["graph_id"] == "small"
-        assert len(payload["nodes"]) == 2, (
-            "the destination holds more nodes than the last save wrote, so "
-            "old content leaked through"
-        )
+        assert link.is_symlink(), "the save replaced the symlink with a regular file"
+        payload = json.loads(real_file.read_text(encoding="utf-8"))
+        assert payload["graph_id"] == "new", "the symlink's target was not updated"
+        assert len(payload["nodes"]) == 5
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
 class TestSnapshotPermissions:
     """``os.replace`` carries the *source* file's mode onto the destination.
 
-    ``tempfile`` creates at 0600, so an atomic write silently demotes an
-    existing snapshot the operator or a sidecar reader depends on. Saving must
-    never narrow a mode the caller already chose.
+    ``tempfile`` creates at 0600, so an atomic write silently demotes a snapshot
+    the operator or a sidecar reader depends on. A save must reproduce what
+    ``open(path, "w")`` did: keep an existing file's mode, and let the umask
+    decide a new one.
     """
 
     def test_existing_mode_is_preserved(self, tmp_path):
@@ -256,41 +222,49 @@ class TestSnapshotPermissions:
         WHEN it is saved again,
         THEN it is still 0644 -- a save does not revoke anyone's read access.
         """
-        path = str(tmp_path / "graph.json")
-        _seeded_graph().save_to_file(path)
-        os.chmod(path, 0o644)
+        path = tmp_path / "graph.json"
+        _seeded_graph().save_to_file(str(path))
+        os.chmod(str(path), 0o644)
 
-        _seeded_graph(4).save_to_file(path)
+        _seeded_graph(4).save_to_file(str(path))
 
-        mode = stat.S_IMODE(os.stat(path).st_mode)
+        mode = stat.S_IMODE(os.stat(str(path)).st_mode)
         assert mode == 0o644, (
             f"saving demoted the snapshot from 0o644 to {oct(mode)}; readers "
             "that relied on the operator's mode silently lose access"
         )
 
-    def test_operator_chosen_group_mode_is_preserved(self, tmp_path):
-        """GIVEN a snapshot deliberately chmod'ed to 0640 by the operator,
-        THEN a later save keeps 0640 rather than imposing its own policy.
-        """
-        path = str(tmp_path / "graph.json")
-        _seeded_graph().save_to_file(path)
-        os.chmod(path, 0o640)
-
-        _seeded_graph(4).save_to_file(path)
-
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-        assert mode == 0o640, f"expected 0o640 preserved, got {oct(mode)}"
-
-    def test_new_snapshot_is_owner_only(self, tmp_path):
+    def test_new_snapshot_uses_the_umask(self, tmp_path):
         """GIVEN no file at the destination,
-        THEN the created snapshot is 0600. There is no previous mode to honour,
-        and owner-only is the right default for a file holding the whole graph.
+        THEN the new snapshot gets the umask-derived mode a plain open() would
+        have produced, rather than tempfile's owner-only 0600.
         """
-        path = str(tmp_path / "graph.json")
-        _seeded_graph().save_to_file(path)
+        umask = os.umask(0)
+        os.umask(umask)
+        path = tmp_path / "graph.json"
 
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-        assert mode == 0o600, f"new snapshot must be owner-only, got {oct(mode)}"
+        _seeded_graph().save_to_file(str(path))
+
+        mode = stat.S_IMODE(os.stat(str(path)).st_mode)
+        assert mode == 0o666 & ~umask, (
+            f"new snapshot is {oct(mode)}, not the {oct(0o666 & ~umask)} a "
+            "plain open() would have created under this umask"
+        )
+
+    def test_setgid_is_not_propagated(self, tmp_path):
+        """GIVEN an existing snapshot carrying setgid,
+        THEN a save copies the permission bits but drops setgid, matching a
+        plain write (Linux strips setgid on write by a non-owner).
+        """
+        path = tmp_path / "graph.json"
+        _seeded_graph().save_to_file(str(path))
+        os.chmod(str(path), 0o2644)
+
+        _seeded_graph(4).save_to_file(str(path))
+
+        mode = os.stat(str(path)).st_mode
+        assert not mode & stat.S_ISGID, "setgid was propagated onto the new file"
+        assert stat.S_IMODE(mode) == 0o644
 
 
 class TestPreservedFailureModes:
@@ -301,12 +275,11 @@ class TestPreservedFailureModes:
         THEN saving raises rather than silently creating the directory. The
         caller chooses where snapshots live; ``save_to_file`` does not.
         """
-        path = str(tmp_path / "no_such_dir" / "graph.json")
+        path = tmp_path / "no_such_dir" / "graph.json"
 
         with pytest.raises(FileNotFoundError):
-            _seeded_graph().save_to_file(path)
+            _seeded_graph().save_to_file(str(path))
 
-        assert not os.path.exists(str(tmp_path / "no_such_dir")), (
-            "save_to_file created the missing parent directory; that is a "
-            "behaviour change callers do not expect"
-        )
+        assert not Path(
+            str(tmp_path / "no_such_dir")
+        ).exists(), "save_to_file created the missing parent directory"
