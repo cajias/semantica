@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadAndReplaceTheOneSnapshotObject",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::<YOUR-BUCKET>/<KEY>"
+    },
+    {
+      "Sid": "SoAMissingSnapshotReportsAs404AndNot403",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<YOUR-BUCKET>"
+    },
+    {
+      "Sid": "ReadTheApiKeySecretAppRunnerInjects",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:<REGION>:<AWS-ACCOUNT-ID>:secret:semantica-api-key-??????"
+    }
+  ]
+}
