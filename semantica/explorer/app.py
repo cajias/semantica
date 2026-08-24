@@ -120,10 +120,7 @@ def create_app(
             active_session.graph, after_restore=active_session.reload_graph
         )
         snapshots.restore()
-        # After _install_mutation_bridge, so the writer's dirty-flag callback
-        # wraps the bridge rather than the reverse. Either order is correct --
-        # both preserve the previous occupant of the single callback slot --
-        # but the restore has to run before the writer can mark anything dirty.
+        # After restore(), so replayed nodes cannot mark the graph dirty.
         snapshots.start()
         yield
         # Stops the writer and takes a final snapshot if the graph is dirty,

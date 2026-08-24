@@ -37,6 +37,39 @@ class FakeStore:
             raise self.error
 
 
+class OrderRecordingStore:
+    """Records the payload each save *completes* with, in completion order.
+
+    The first save blocks until a second one starts, so an implementation that
+    lets two saves overlap deterministically completes them in the wrong order
+    instead of failing only under an unlucky schedule.
+    """
+
+    description = "ordering store"
+
+    def __init__(self):
+        self.first_started = threading.Event()
+        self.second_started = threading.Event()
+        self.started = []
+        self.completed = []
+
+    def load(self, graph):
+        return False
+
+    def save(self, graph):
+        payload = tuple(sorted(graph.nodes))
+        self.started.append(payload)
+        if self.first_started.is_set():
+            self.second_started.set()
+        else:
+            self.first_started.set()
+            # Times out only when the second save is serialised behind this
+            # one. An overlapping second save sets it at once, and this save
+            # then completes last, carrying the stale payload.
+            self.second_started.wait(timeout=1.0)
+        self.completed.append(payload)
+
+
 def _graph():
     return ContextGraph(advanced_analytics=False)
 
@@ -362,3 +395,91 @@ class TestShutdown:
         service.stop()
 
         assert service._thread is None
+
+    def test_the_final_snapshot_lands_after_an_upload_still_in_flight(
+        self, monkeypatch
+    ):
+        """GIVEN a save still in flight when the bounded join times out
+        WHEN stop() takes its final snapshot
+        THEN the newest payload is the one that lands last.
+
+        S3 resolves two PUTs against one key by *completion* order, so a final
+        write that overlaps the upload it raced can complete first and leave the
+        stale payload as the stored one -- silently, with stop() reporting no
+        error. That is the lossless-redeploy case this feature exists for.
+        """
+        graph = _graph()
+        store = OrderRecordingStore()
+        monkeypatch.setattr(snapshot_module, "STOP_JOIN_TIMEOUT", 0.05)
+        service = _started(graph, store, monkeypatch, interval=0.02)
+        writer = service._thread
+        try:
+            _add(graph, "v1")
+            assert store.first_started.wait(timeout=5)
+            _add(graph, "v2")
+        finally:
+            service.stop()
+
+        # stop() abandons the writer at the join timeout, which is the whole
+        # premise here -- so wait for the in-flight save to actually finish
+        # before reading the completion order.
+        assert writer is not None
+        writer.join(timeout=5)
+        assert not writer.is_alive()
+
+        assert store.started == [("v1",), ("v1", "v2")]
+        assert store.completed[-1] == ("v1", "v2"), (
+            "the stale payload completed last, so it is the one S3 would keep: "
+            "{}".format(store.completed)
+        )
+
+    def test_stop_restores_the_previous_mutation_callback(self, monkeypatch):
+        """GIVEN a bridge callback installed before the writer
+        WHEN the service is stopped
+        THEN the bridge is back in the slot and still receives mutations.
+
+        The Explorer installs its WebSocket bridge before the writer, so the
+        writer's captured ``previous_callback`` *is* the bridge and has to
+        survive the writer being removed.
+        """
+        graph = _graph()
+        seen = []
+
+        def bridge(*args):
+            seen.append(args[0])
+
+        graph.mutation_callback = bridge
+        service = _started(graph, FakeStore(), monkeypatch, interval=3600)
+
+        service.stop()
+
+        assert graph.mutation_callback is bridge
+        _add(graph, "after_stop")
+        assert seen == ["ADD_NODE"]
+
+    def test_a_second_service_over_one_graph_still_snapshots(self, monkeypatch):
+        """GIVEN a graph that outlives the service that snapshotted it
+        WHEN a second service runs over the same graph and it is mutated
+        THEN the mutation reaches a snapshot.
+
+        ``create_app()`` builds its ``GraphSession`` outside the lifespan, so
+        one graph survives across lifespan runs of one app object -- two
+        ``with TestClient(app):`` blocks are enough. The idempotence guard
+        lives on the graph and the dirty flag on the service, so a callback
+        left installed by run 1 makes run 2 permanently clean: every snapshot,
+        including the shutdown one, silently does nothing and reports success.
+        """
+        graph = _graph()
+        first = _started(graph, FakeStore(), monkeypatch, interval=3600)
+        _add(graph, "run_one")
+        first.stop()
+
+        second_store = FakeStore()
+        second = _started(graph, second_store, monkeypatch, interval=3600)
+        try:
+            _add(graph, "run_two")
+        finally:
+            second.stop()
+
+        assert second_store.saves == 1
+        assert second_store.saved_node_counts == [2]

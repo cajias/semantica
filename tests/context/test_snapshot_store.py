@@ -162,6 +162,38 @@ class TestUriParsing:
         with pytest.raises(ValidationError, match="bucket and an object key"):
             snapshot.SnapshotStore(uri)
 
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "s3:/bucket/key",  # one slash
+            "S3://bucket/key",  # wrong case
+            "s3a://bucket/key",  # the Hadoop scheme
+            "https://host/key",
+            "file:///data/key",
+        ],
+    )
+    def test_a_mistyped_scheme_is_rejected(self, uri):
+        """GIVEN a URI that looks like a scheme but is not ``s3://``,
+        THEN construction raises rather than treating it as a local path.
+
+        Silently falling through to the filesystem is durability loss dressed
+        as success: the service logs the destination, snapshots every interval
+        and reports success, while writing the whole graph into the container's
+        ephemeral layer -- gone on every redeploy, and ``makedirs`` happily
+        creates a directory literally named ``s3:``.
+        """
+        with pytest.raises(ValidationError, match=r"s3://"):
+            snapshot.SnapshotStore(uri)
+
+    @pytest.mark.parametrize(
+        "uri", ["/data/graph.json", "relative/graph.json", "C:\\data\\graph.json", URI]
+    )
+    def test_a_real_path_or_a_real_s3_uri_is_accepted(self, uri):
+        """GIVEN a plain filesystem path or a well-formed ``s3://`` URI,
+        THEN the scheme guard leaves it alone. A plain path has no ``://``.
+        """
+        assert snapshot.SnapshotStore(uri, client=object()).uri == uri
+
     @pytest.mark.parametrize("uri", ["", "   ", None])
     def test_an_empty_uri_is_rejected(self, uri):
         """GIVEN no URI at all,

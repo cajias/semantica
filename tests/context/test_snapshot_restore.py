@@ -1,11 +1,13 @@
 """Tests for :class:`semantica.context.snapshot.SnapshotService` restore."""
 
 import json
+import logging
 
 import pytest
 
 from semantica.context.context_graph import ContextGraph
 from semantica.context.snapshot import SNAPSHOT_URI_ENV, SnapshotService, SnapshotStore
+from semantica.utils.exceptions import ValidationError
 
 
 def _graph_with(node_id: str) -> ContextGraph:
@@ -78,6 +80,45 @@ class TestRestore:
 
         assert service._store is None
         assert service.restore() is False
+
+    def test_a_set_uri_with_no_graph_warns_before_disabling(
+        self, monkeypatch, caplog, tmp_path
+    ):
+        """GIVEN a set snapshot URI and a caller whose graph failed to build
+        WHEN a service is built from the environment
+        THEN persistence is disabled *and* the operator is told, naming the URI.
+
+        Running ``semantica-server`` from an image without the explorer extra
+        leaves ``session = None``, so this is the shape an operator who
+        configured snapshots actually hits: previously it produced no output at
+        all -- a healthy server, silently storing nothing.
+        """
+        path = str(tmp_path / "snapshot.json")
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, path)
+
+        with caplog.at_level(logging.WARNING):
+            service = SnapshotService.from_env(None)
+
+        assert service._store is None
+        assert SNAPSHOT_URI_ENV in caplog.text
+        assert path in caplog.text, (
+            "a set snapshot URI was disabled without naming it: " + caplog.text
+        )
+
+    def test_a_malformed_uri_raises_even_without_a_graph(self, monkeypatch):
+        """GIVEN a snapshot URI that cannot be parsed
+        WHEN a service is built from the environment with graph=None
+        THEN it raises, exactly as it does when a graph *is* present.
+
+        A misconfigured destination is not the same thing as a disabled one.
+        The graph-present path (``explorer/app.py`` always passes one) has
+        always raised here, so staying quiet on the graph-None path would make
+        a typo loud on one entry point and silent on the other.
+        """
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, "s3:/typo/one-slash")
+
+        with pytest.raises(ValidationError):
+            SnapshotService.from_env(None)
 
     def test_corrupt_snapshot_raises(self, tmp_path):
         """GIVEN a corrupt snapshot payload

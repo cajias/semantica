@@ -16,6 +16,11 @@ permissions failure would let the next interval tick overwrite a perfectly good
 snapshot with an empty one. That is data loss disguised as a successful start-up.
 Section 6 of the same document has the application fail closed on
 misconfiguration; this is the same principle applied to storage.
+
+Both S3 directions stage the payload through a file under ``TMPDIR``, so
+``TMPDIR`` must be disk-backed and sized for the serialised graph. A hardened
+container runtime commonly mounts ``/tmp`` as a tmpfs capped at 64 MB, where a
+larger graph fails ``ENOSPC`` on every interval tick -- safely, but forever.
 """
 
 import contextlib
@@ -104,6 +109,16 @@ class SnapshotStore:
         if uri.startswith(_S3_SCHEME):
             self.bucket, self.key = _parse_s3_uri(uri)
             self.path = None
+        elif "://" in uri or uri.startswith("s3:"):
+            # A near-miss scheme -- s3:/one/slash, S3://, s3a://, https://,
+            # file:// -- would otherwise become a local path, so the service
+            # would log a destination, snapshot every interval and report
+            # success while writing into the container's ephemeral layer. A
+            # genuine filesystem path, relative or Windows-style, has no "://".
+            raise ValidationError(
+                "{} must be an s3://<bucket>/<key> URI or a plain filesystem "
+                "path; got {!r}".format(SNAPSHOT_URI_ENV, uri)
+            )
         else:
             self.bucket, self.key = None, None
             self.path = uri
@@ -155,10 +170,9 @@ class SnapshotStore:
         return True
 
     def _save_file(self, graph: Any, path: str) -> None:
-        # save_to_file deliberately refuses to create the parent directory --
-        # the library caller owns the location. Here the location is deployment
-        # config and a freshly mounted volume legitimately starts empty, so a
-        # missing directory is a first-run condition, not a permanent failure.
+        # save_to_file refuses to create the parent directory, but here a
+        # freshly mounted volume legitimately starts empty: first run, not
+        # permanent failure.
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         graph.save_to_file(path)
 
@@ -171,9 +185,8 @@ class SnapshotStore:
         # cannot verify a runtime-computed except clause.
         except self._absent_object_errors(client) as error:  # type: ignore[misc]
             if not _is_absent_object(error):
-                # AccessDenied, NoSuchBucket, a throttle: raise. Reporting
-                # "no snapshot" here would start an empty graph and let the
-                # next interval tick replace a good object with an empty one.
+                # AccessDenied, NoSuchBucket, a throttle: raise, per the
+                # asymmetry in the module docstring.
                 raise
             logger.info(
                 "no snapshot object at %s; starting with an empty graph",
@@ -201,10 +214,9 @@ class SnapshotStore:
         with tempfile.TemporaryDirectory() as staging:
             staged = os.path.join(staging, "snapshot.json")
             graph.save_to_file(staged)
-            # put_object streams a file object, so the payload is never held in
-            # memory a second time. save_to_file has already released the graph
-            # lock by here: an upload must not block every mutation for a
-            # network round trip.
+            # put_object streams the file rather than reading it into a bytes
+            # object. The staging file still costs its own copy, and on a tmpfs
+            # /tmp that copy is memory -- see the module docstring on TMPDIR.
             with open(staged, "rb") as handle:
                 client.put_object(Bucket=self.bucket, Key=self.key, Body=handle)
         logger.info("wrote context graph snapshot to %s", self.description)
@@ -245,12 +257,15 @@ def snapshot_interval_from_env(env: Optional[Dict[str, str]] = None) -> int:
     """
     source = os.environ if env is None else env
     raw = (source.get(SNAPSHOT_INTERVAL_ENV) or "").strip()
+    # Kept separate from the guard below: an *unset* optional knob is not a
+    # misconfiguration, and warning about it would put a line in every default
+    # deployment's start-up log.
     if not raw:
         return DEFAULT_SNAPSHOT_INTERVAL
     try:
         seconds = int(raw)
     except ValueError:
-        seconds = 0
+        seconds = 0  # not a whole number, so not a usable interval
     if seconds <= 0:
         logger.warning(
             "%s=%r is not a positive whole number of seconds; using %d",
@@ -291,11 +306,8 @@ class SnapshotService:
     two FastAPI lifespans (``server.py`` and ``explorer/app.py``) share one
     implementation instead of two copies that drift apart.
 
-    A ``store`` of None means ``SEMANTICA_SNAPSHOT_URI`` is unset: persistence
-    is off and every method is a no-op, so the wiring is unconditional and the
-    decision stays where it belongs, in deployment config. A ``graph`` of None
-    disables it the same way, which is what a caller whose graph failed to
-    build passes.
+    A ``store`` of None turns persistence off and makes every method a no-op,
+    so the wiring can stay unconditional; a ``graph`` of None does the same.
     """
 
     def __init__(
@@ -321,13 +333,32 @@ class SnapshotService:
         self._dirty = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Serialises writes to the one destination object, so the final
+        # snapshot queues behind any in-flight one instead of racing it.
+        self._write_lock = threading.Lock()
+        self._installed = False
+        self._previous_callback: Optional[Callable[..., None]] = None
 
     @classmethod
     def from_env(
         cls, graph: Any, after_restore: Optional[Callable[[], None]] = None
     ) -> "SnapshotService":
         """Build a service from ``SEMANTICA_SNAPSHOT_URI``, disabled if unset."""
-        store = None if graph is None else snapshot_store_from_env()
+        store = snapshot_store_from_env()
+        if store is not None and graph is None:
+            # Warned rather than raised: the caller has legitimate routes that
+            # do not need a graph, and refusing to start over a disabled
+            # snapshot would be a worse trade than serving without persistence
+            # and saying so. Silence was the bug -- an operator who set the URI
+            # got a healthy server storing nothing, with no line explaining it.
+            logger.warning(
+                "%s is set (%s) but there is no context graph to snapshot, so "
+                "persistence is DISABLED; the graph failed to build, or this "
+                "image lacks the explorer extra",
+                SNAPSHOT_URI_ENV,
+                store.description,
+            )
+            store = None
         return cls(graph, store, after_restore=after_restore)
 
     def restore(self) -> bool:
@@ -383,14 +414,15 @@ class SnapshotService:
         self._stop.set()
         thread = self._thread
         if thread is not None:
-            # Bounded: the wait() returns at once, but a save already under way
-            # is a network round trip, and a shutdown grace period is finite.
             thread.join(timeout=STOP_JOIN_TIMEOUT)
             if thread.is_alive():
+                # Only a warning: the write lock, not this join, is what keeps
+                # the final snapshot ordered after an upload still in flight.
                 logger.warning(
                     "snapshot writer did not stop within %ss", STOP_JOIN_TIMEOUT
                 )
             self._thread = None
+        self._restore_mutation_callback()
         # snapshot_if_dirty logs a failure at ERROR and returns rather than
         # raising: an exception here would escape into the lifespan's teardown
         # and mask whatever else was shutting down.
@@ -411,6 +443,8 @@ class SnapshotService:
             return
         graph._snapshot_writer_installed = True
         previous_callback = getattr(graph, "mutation_callback", None)
+        self._previous_callback = previous_callback
+        self._installed = True
 
         def on_mutation(
             event_type: str, entity_id: str, payload: Dict[str, Any]
@@ -420,6 +454,26 @@ class SnapshotService:
                 previous_callback(event_type, entity_id, payload)
 
         graph.mutation_callback = on_mutation
+
+    def _restore_mutation_callback(self) -> None:
+        """Put the previous occupant back and release the idempotence guard.
+
+        The guard lives on the *graph* while the dirty flag lives on the
+        service, so a graph that outlives one service -- ``create_app()`` builds
+        its ``GraphSession`` outside the lifespan -- would make the next
+        service's callback early-return and leave it permanently clean, every
+        snapshot silently doing nothing and reporting success.
+
+        Only the service that actually installed restores anything: the
+        previous occupant of a service that early-returned is not its to give
+        back. The captured callback is the Explorer's WebSocket bridge, which
+        was installed first and has to survive the writer being removed.
+        """
+        if not self._installed:
+            return
+        self._graph.mutation_callback = self._previous_callback
+        self._graph._snapshot_writer_installed = False
+        self._installed = False
 
     def _run(self) -> None:
         # wait() rather than sleep(): a stop is picked up immediately instead
@@ -432,31 +486,38 @@ class SnapshotService:
 
         One tick of the interval writer, exposed so it can be driven directly.
 
+        Held under a write lock for the whole body, so two callers cannot have
+        a write to the one destination object in flight at the same time. S3
+        resolves competing PUTs on one key by *completion* order, so an
+        overlapping shutdown write can finish before the upload it raced and
+        leave the older payload stored -- silently, reporting success. Queuing
+        instead makes the last write to land the newest one by construction.
+
+        This is deliberately not ``graph._lock``: the payload is built under
+        that lock and released before the upload, so a network round trip must
+        not block every mutation.
+
         Returns:
             True if a snapshot was written.
         """
-        store = self._store
-        if store is None or not self._dirty:
-            return False
-        # Cleared BEFORE the write. A mutation landing mid-upload then re-marks
-        # the flag and the next tick picks it up; clearing afterwards would
-        # swallow that edit until some unrelated later one.
-        self._dirty = False
-        try:
-            # No lock is taken here. save_to_file builds its payload under the
-            # graph lock and releases it before writing, so an upload does not
-            # block every mutation for a network round trip.
-            store.save(self._graph)
-        except Exception:
-            # One transient S3 failure must not stop all persistence, so the
-            # thread logs and keeps looping.
-            # ponytail: no back-off. A failed write leaves the graph dirty, so
-            # the retry is already one interval away -- that IS the back-off,
-            # and stretching it would only widen the window of loss.
-            self._dirty = True
-            logger.exception(
-                "snapshot to %s failed; retrying at the next interval",
-                store.description,
-            )
-            return False
-        return True
+        with self._write_lock:
+            store = self._store
+            if store is None or not self._dirty:
+                return False
+            # Cleared BEFORE the write. A mutation landing mid-upload then
+            # re-marks the flag and the next tick picks it up; clearing
+            # afterwards would swallow that edit until some unrelated later one.
+            self._dirty = False
+            try:
+                store.save(self._graph)
+            except Exception:
+                # ponytail: no back-off. A failed write leaves the graph dirty,
+                # so the retry is already one interval away -- that IS the
+                # back-off, and stretching it would only widen the loss window.
+                self._dirty = True
+                logger.exception(
+                    "snapshot to %s failed; retrying at the next interval",
+                    store.description,
+                )
+                return False
+            return True
