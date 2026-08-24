@@ -27,8 +27,13 @@ COPY semantica/ ./semantica/
 COPY integrations/ ./integrations/
 COPY --from=frontend-builder /app/semantica/static ./semantica/static
 
+# /data must exist and be owned here, not left to the volume mount: Docker
+# copies ownership onto a fresh named volume only from a directory already
+# present in the image. A mountpoint Docker creates itself is root:root 0755,
+# which the non-root `semantica` user cannot write.
 RUN pip install --no-cache-dir ".[explorer]" \
-    && chown -R semantica:semantica /app
+    && mkdir -p /data \
+    && chown -R semantica:semantica /app /data
 
 USER semantica
 
