@@ -21,6 +21,7 @@ misconfiguration; this is the same principle applied to storage.
 import contextlib
 import os
 import tempfile
+import threading
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 from ..utils.exceptions import ProcessingError, ValidationError
@@ -40,6 +41,10 @@ except (ImportError, OSError):  # native wheels fail with OSError, not ImportErr
 SNAPSHOT_URI_ENV = "SEMANTICA_SNAPSHOT_URI"
 SNAPSHOT_INTERVAL_ENV = "SEMANTICA_SNAPSHOT_INTERVAL"
 DEFAULT_SNAPSHOT_INTERVAL = 30
+# Seconds a shutdown will wait for an upload already in flight. Long enough for
+# an S3 round trip, short enough to leave room in a platform grace period for
+# the final snapshot that follows.
+STOP_JOIN_TIMEOUT = 10.0
 
 _S3_SCHEME = "s3://"
 # S3 answers a missing object with NoSuchKey, and a HeadObject-shaped 404 with
@@ -312,6 +317,10 @@ class SnapshotService:
         self._graph = graph
         self._store = store
         self._after_restore = after_restore
+        self._interval = snapshot_interval_from_env()
+        self._dirty = False
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
     @classmethod
     def from_env(
@@ -337,3 +346,107 @@ class SnapshotService:
         if restored and self._after_restore is not None:
             self._after_restore()
         return restored
+
+    def start(self) -> "SnapshotService":
+        """Watch the graph for changes and snapshot it on an interval.
+
+        Returns self, so a lifespan can build and start in one statement.
+        """
+        if self._store is None or self._thread is not None:
+            return self
+        self._mark_dirty_on_mutation()
+        # A daemon thread rather than an asyncio task: the save is blocking
+        # network I/O that would stall the event loop, asyncio.to_thread is
+        # 3.9+ while library code targets >=3.8, and threads are the house
+        # mechanism already (pipeline/parallelism_manager.py). Daemon, so a
+        # hard kill cannot be held up by the writer.
+        self._thread = threading.Thread(
+            target=self._run, name="semantica-snapshot-writer", daemon=True
+        )
+        self._thread.start()
+        logger.info(
+            "snapshotting %s every %ds while dirty",
+            self._store.description,
+            self._interval,
+        )
+        return self
+
+    def stop(self) -> None:
+        """Stop the interval writer and wait for a tick in flight to finish."""
+        self._stop.set()
+        thread = self._thread
+        if thread is None:
+            return
+        # Bounded: the wait() returns at once, but a save already under way is
+        # a network round trip, and a shutdown grace period is finite.
+        thread.join(timeout=STOP_JOIN_TIMEOUT)
+        if thread.is_alive():
+            logger.warning(
+                "snapshot writer did not stop within %ss", STOP_JOIN_TIMEOUT
+            )
+        self._thread = None
+
+    def _mark_dirty_on_mutation(self) -> None:
+        """Chain a dirty-flag setter onto the graph's mutation callback.
+
+        ``mutation_callback`` is a single attribute slot, not a listener list,
+        and the Explorer's WebSocket bridge and change_management both want it.
+        The previous occupant is captured and called, so whoever installs
+        second wraps the first instead of silencing it. Installation is
+        idempotent, or wiring twice would call the previous callback twice per
+        mutation.
+        """
+        graph = self._graph
+        if getattr(graph, "_snapshot_writer_installed", False):
+            return
+        graph._snapshot_writer_installed = True
+        previous_callback = getattr(graph, "mutation_callback", None)
+
+        def on_mutation(
+            event_type: str, entity_id: str, payload: Dict[str, Any]
+        ) -> None:
+            self._dirty = True
+            if callable(previous_callback):
+                previous_callback(event_type, entity_id, payload)
+
+        graph.mutation_callback = on_mutation
+
+    def _run(self) -> None:
+        # wait() rather than sleep(): a stop is picked up immediately instead
+        # of after the rest of the interval.
+        while not self._stop.wait(self._interval):
+            self.snapshot_if_dirty()
+
+    def snapshot_if_dirty(self) -> bool:
+        """Write a snapshot if the graph changed since the last one.
+
+        One tick of the interval writer, exposed so it can be driven directly.
+
+        Returns:
+            True if a snapshot was written.
+        """
+        store = self._store
+        if store is None or not self._dirty:
+            return False
+        # Cleared BEFORE the write. A mutation landing mid-upload then re-marks
+        # the flag and the next tick picks it up; clearing afterwards would
+        # swallow that edit until some unrelated later one.
+        self._dirty = False
+        try:
+            # No lock is taken here. save_to_file builds its payload under the
+            # graph lock and releases it before writing, so an upload does not
+            # block every mutation for a network round trip.
+            store.save(self._graph)
+        except Exception:
+            # One transient S3 failure must not stop all persistence, so the
+            # thread logs and keeps looping.
+            # ponytail: no back-off. A failed write leaves the graph dirty, so
+            # the retry is already one interval away -- that IS the back-off,
+            # and stretching it would only widen the window of loss.
+            self._dirty = True
+            logger.exception(
+                "snapshot to %s failed; retrying at the next interval",
+                store.description,
+            )
+            return False
+        return True

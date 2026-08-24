@@ -76,6 +76,7 @@ async def lifespan(app: FastAPI):
         after_restore=session.reload_graph if session else None,
     )
     snapshots.restore()
+    snapshots.start()
 
     yield
 
