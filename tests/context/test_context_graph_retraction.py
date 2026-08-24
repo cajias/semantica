@@ -461,6 +461,112 @@ class TestClearResetsRecords(unittest.TestCase):
         self.assertTrue(graph.retract_node("alice", at=CUTOFF))
 
 
+class TestSnapshotRoundTripPreservesRecords(unittest.TestCase):
+    """The retraction *effect* already survived a round trip; the *record* did not.
+
+    ``valid_until`` is on the node, so ``add_nodes`` reads it back and nothing
+    resurrects. But ``_retractions``/``_tombstones`` were never serialized, so
+    the ``purged_at``/``reason`` proof that an erasure happened disappeared. That
+    was tolerable while a round trip was an explicit user action; the snapshot
+    writer makes it the automatic every-restart path.
+    """
+
+    def _round_trip(self, graph):
+        restored = ContextGraph(advanced_analytics=False)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "graph.json")
+            graph.save_to_file(path)
+            restored.load_from_file(path)
+        return restored
+
+    def test_retraction_records_survive(self):
+        graph = _graph()
+        graph.retract_node("alice", reason="superseded by #42", at=CUTOFF)
+
+        restored = self._round_trip(graph)
+
+        self.assertEqual(restored.list_retractions(), graph.list_retractions())
+        record = restored.get_retraction("alice", "node")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["reason"], "superseded by #42")
+        self.assertEqual(record["entity_kind"], "node")
+        self.assertEqual(
+            record["retracted_at"],
+            graph.get_retraction("alice", "node")["retracted_at"],
+        )
+
+    def test_tombstones_survive(self):
+        graph = _graph()
+        graph.purge_node("bob", reason="GDPR erasure request 7", at=CUTOFF)
+
+        restored = self._round_trip(graph)
+
+        self.assertEqual(restored.list_tombstones(), graph.list_tombstones())
+        record = restored.get_tombstone("bob", "node")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["reason"], "GDPR erasure request 7")
+        self.assertEqual(
+            record["purged_at"], graph.get_tombstone("bob", "node")["purged_at"]
+        )
+
+    def test_the_two_id_keyspaces_stay_separate(self):
+        """JSON has no tuple keys, so the ``(kind, id)`` key is rebuilt from the
+        record's own ``entity_kind``/``entity_id`` -- a node record must not be
+        able to mask an edge of the same id, or vice versa.
+        """
+        graph = ContextGraph(advanced_analytics=False)
+        graph.add_node("alice", "person")
+        graph.add_node("acme", "org")
+        graph.add_edge("alice", "acme", "works_at")
+        edge_id = graph.edges[0].edge_id
+        # Same id in both keyspaces.
+        graph.add_node(edge_id, "person")
+        graph.retract_node(edge_id, reason="node record", at=CUTOFF)
+        graph.retract_edge(edge_id, reason="edge record", at=CUTOFF)
+
+        restored = self._round_trip(graph)
+
+        self.assertEqual(
+            restored.get_retraction(edge_id, "node")["reason"], "node record"
+        )
+        self.assertEqual(
+            restored.get_retraction(edge_id, "edge")["reason"], "edge record"
+        )
+
+    def test_a_retracted_entity_is_still_recorded_as_retracted(self):
+        """The record is what makes retraction idempotent, so restoring it has
+        to restore that too: retracting again must still be a no-op.
+        """
+        graph = _graph()
+        graph.retract_node("alice", at=CUTOFF)
+
+        restored = self._round_trip(graph)
+
+        self.assertFalse(restored.retract_node("alice", at=CUTOFF))
+
+    def test_a_payload_without_the_keys_still_loads(self):
+        """Backward compatibility: a snapshot written before the keys existed
+        must load exactly as it does today, with no records.
+        """
+        graph = _graph()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "graph.json")
+            graph.save_to_file(path)
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            payload.pop("retractions", None)
+            payload.pop("tombstones", None)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+
+            restored = ContextGraph(advanced_analytics=False)
+            restored.load_from_file(path)
+
+        self.assertEqual(sorted(restored.nodes), sorted(graph.nodes))
+        self.assertEqual(restored.list_retractions(), [])
+        self.assertEqual(restored.list_tombstones(), [])
+
+
 class TestAuditTrailIntegration(unittest.TestCase):
     """Against the real TemporalVersionManager, not a mock callback."""
 

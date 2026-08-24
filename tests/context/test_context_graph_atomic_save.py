@@ -244,6 +244,49 @@ class TestSuccessfulSave:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
+class TestSerializedPayloadIsDetached:
+    """``save_to_file`` builds its payload under the lock, then dumps it outside.
+
+    Anything still shared by reference with live graph state can therefore be
+    mutated *during* ``json.dump``, yielding either ``RuntimeError: dictionary
+    changed size during iteration`` or a torn payload mixing pre- and
+    post-mutation state. The 30-second snapshot writer now serialises
+    concurrently with request handling, which is what makes this reachable.
+    """
+
+    def test_edge_to_dict_does_not_hand_out_the_live_metadata(self):
+        """GIVEN an edge with metadata,
+        WHEN ``to_dict`` is called and the edge's metadata is then mutated,
+        THEN the returned dict is unaffected -- it is a copy, matching what
+        ``ContextNode.to_dict`` already did.
+
+        Shallow, like the node sibling: nested values stay shared. A deep copy
+        would be paid on every snapshot of every edge for a case no caller has.
+        """
+        graph = _seeded_graph(2, "detached")
+        edge = graph.edges[0]
+        edge.metadata["kept"] = "original"
+
+        payload = edge.to_dict()
+        edge.metadata["added_during_dump"] = "torn"
+        edge.metadata["kept"] = "mutated"
+
+        assert payload["properties"] is not edge.metadata
+        assert "added_during_dump" not in payload["properties"]
+        assert payload["properties"]["kept"] == "original"
+
+    def test_node_to_dict_already_copies(self):
+        """The parity this fix restores, pinned so it cannot regress either."""
+        graph = _seeded_graph(1, "detached")
+        node = graph.nodes["n0"]
+        node.metadata["kept"] = "original"
+
+        payload = node.to_dict()
+        node.metadata["added_during_dump"] = "torn"
+
+        assert "added_during_dump" not in payload["properties"]
+
+
 class TestSnapshotPermissions:
     """``os.replace`` carries the *source* file's mode onto the destination.
 
