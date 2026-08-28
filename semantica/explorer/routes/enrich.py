@@ -365,52 +365,79 @@ async def merge_nodes(
         graph = session.graph
 
         for duplicate_id in duplicate_ids:
-            if duplicate_id == primary_id or duplicate_id not in graph:
-                continue
+            # The whole collapse runs under graph._lock (an RLock, so the
+            # nested graph.add_edges() below is fine): the snapshot writer
+            # serialises graph.nodes/graph.edges from its own thread and would
+            # otherwise be able to observe the edge list already replaced while
+            # the node is still present.
+            with graph._lock:
+                if duplicate_id == primary_id or duplicate_id not in graph:
+                    continue
 
-            duplicate_node = graph.nodes.get(duplicate_id)
-            primary_node = graph.nodes.get(primary_id)
-            if duplicate_node and primary_node:
-                for key, value in (duplicate_node.properties or {}).items():
-                    if key not in (primary_node.properties or {}):
-                        primary_node.properties[key] = value
-                        primary_node.metadata[key] = value
+                duplicate_node = graph.nodes.get(duplicate_id)
+                primary_node = graph.nodes.get(primary_id)
+                if duplicate_node and primary_node:
+                    for key, value in (duplicate_node.properties or {}).items():
+                        if key not in (primary_node.properties or {}):
+                            primary_node.properties[key] = value
+                            primary_node.metadata[key] = value
 
-            edges_to_add = []
-            retained_edges = []
-            for edge in list(graph.edges):
-                if edge.source_id == duplicate_id or edge.target_id == duplicate_id:
-                    new_source = primary_id if edge.source_id == duplicate_id else edge.source_id
-                    new_target = primary_id if edge.target_id == duplicate_id else edge.target_id
-                    if new_source != new_target:
-                        edges_to_add.append(
-                            {
-                                "source_id": new_source,
-                                "target_id": new_target,
-                                "type": edge.edge_type,
-                                "weight": edge.weight,
-                                "properties": edge.metadata,
-                            }
+                edges_to_add = []
+                retained_edges = []
+                for edge in list(graph.edges):
+                    if edge.source_id == duplicate_id or edge.target_id == duplicate_id:
+                        source_id, target_id = edge.source_id, edge.target_id
+                        new_source = (
+                            primary_id if source_id == duplicate_id else source_id
                         )
-                        edges_updated += 1
-                else:
-                    retained_edges.append(edge)
+                        new_target = (
+                            primary_id if target_id == duplicate_id else target_id
+                        )
+                        if new_source != new_target:
+                            edges_to_add.append(
+                                {
+                                    "source_id": new_source,
+                                    "target_id": new_target,
+                                    "type": edge.edge_type,
+                                    "weight": edge.weight,
+                                    "properties": edge.metadata,
+                                }
+                            )
+                            edges_updated += 1
+                    else:
+                        retained_edges.append(edge)
 
-            graph.edges = retained_edges
-            graph._adjacency.pop(duplicate_id, None)
-            for adjacency in graph._adjacency.values():
-                adjacency[:] = [edge for edge in adjacency if edge.target_id != duplicate_id]
-            graph.edge_type_index.clear()
-            for edge in graph.edges:
-                graph.edge_type_index[edge.edge_type].append(edge)
+                graph.edges = retained_edges
+                graph._adjacency.pop(duplicate_id, None)
+                for adjacency in graph._adjacency.values():
+                    adjacency[:] = [
+                        edge for edge in adjacency if edge.target_id != duplicate_id
+                    ]
+                graph.edge_type_index.clear()
+                for edge in graph.edges:
+                    graph.edge_type_index[edge.edge_type].append(edge)
 
-            old_type = graph.nodes[duplicate_id].node_type
-            graph.node_type_index.get(old_type, set()).discard(duplicate_id)
-            del graph.nodes[duplicate_id]
-            removed.append(duplicate_id)
+                old_type = graph.nodes[duplicate_id].node_type
+                graph.node_type_index.get(old_type, set()).discard(duplicate_id)
+                del graph.nodes[duplicate_id]
+                # Announce the removal: this direct mutation bypasses every
+                # ContextGraph write method, so without it the snapshot writer
+                # never sees the merge and a restart resurrects the duplicate
+                # whenever no edge was re-pointed (isolated node, or every edge
+                # collapsing into a self-loop).
+                graph._emit_mutation(
+                    "REMOVE_NODE",
+                    duplicate_id,
+                    {
+                        "entity_id": duplicate_id,
+                        "entity_kind": "node",
+                        "merged_into": primary_id,
+                    },
+                )
+                removed.append(duplicate_id)
 
-            if edges_to_add:
-                graph.add_edges(edges_to_add)
+                if edges_to_add:
+                    graph.add_edges(edges_to_add)
 
         return removed, edges_updated
 
