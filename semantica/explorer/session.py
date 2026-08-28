@@ -472,7 +472,23 @@ class GraphSession:
         """
         self.handle_graph_mutation("RELOAD_GRAPH", "", {})
 
-    def handle_graph_mutation(self, event_type: str, entity_id: str, payload: Dict[str, Any]) -> None:
+    def handle_graph_mutation(
+        self, event_type: str, entity_id: str, payload: Dict[str, Any]
+    ) -> None:
+        """Apply one mutation announcement to the session's derived state.
+
+        Six of the ten recognised operations come from ``ContextGraph``'s shared
+        write path, and ``RELOAD_GRAPH`` from ``reload_graph`` above. The other
+        three — ``DELETE_NODE``, ``DELETE_EDGE``, ``RESET_GRAPH`` — are synonyms
+        kept on purpose, not dead branches: ``ContextGraph.mutation_callback``
+        is a public single-slot attribute anything may occupy (see
+        ``change_management/managers.py``), so an emitter that prefers
+        "delete"/"reset" still lands on the right handler. Pinned by
+        ``tests/explorer/test_graph_session_mutation_aliases.py``.
+
+        An unrecognised operation is a deliberate no-op: this runs inside a
+        caller's write and must never raise back into one.
+        """
         normalized_event = str(event_type or "").upper()
         if normalized_event in {
             "ADD_NODE",
