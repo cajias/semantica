@@ -1,13 +1,20 @@
 """Mintlify docs integrity checker — run before merging any docs PR."""
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
 import re
 import subprocess
 import sys
-from typing import Any, Callable, cast
+import tempfile
+from typing import Any, Callable, Iterator, cast
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX (Windows) — no advisory locking available
+    fcntl = None  # type: ignore[assignment]
 
 try:
     from rich.console import Console as _Console
@@ -227,21 +234,44 @@ def _() -> list[str]:
 
 
 # ── 10. Mintlify export succeeds (requires Node.js / npx) ────────────────────
+@contextlib.contextmanager
+def _export_lock() -> Iterator[None]:
+    """Serialise `mintlify export` machine-wide.
+
+    The CLI wipes and regenerates a shared per-user scaffold
+    (`~/.mintlify/mint/apps/client/src/_props/`), chdir()s into it, then lets
+    Next.js read `src/_props/generatedDocsNav.json` from there. Two concurrent
+    invocations — even from different checkouts — race on that one directory
+    and the loser dies with
+    `ENOENT: ... open 'src/_props/generatedDocsNav.json'`. The lock therefore
+    lives in the temp dir, not the repo: the contended resource is per-machine.
+    """
+    if fcntl is None:  # Windows: nothing to serialise against
+        yield
+        return
+    lock_path = os.path.join(
+        tempfile.gettempdir(), f"mintlify-export-{os.getuid()}.lock"
+    )
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # released when the fd closes
+        yield
+
+
 @check("Mintlify export builds without errors")
 def _() -> list[str]:
     npx = "npx.cmd" if sys.platform == "win32" else "npx"
+    # Per-process name so queued runs never fight over one output file.
+    zip_name = f"export_ci_check_{os.getpid()}.zip"
+    zip_path = os.path.join(DOCS, zip_name)
     try:
-        result = subprocess.run(
-            [npx, "--yes", "mintlify@4.2.632", "export", "--output", "export_ci_check.zip"],
-            cwd=DOCS,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        # Clean up zip regardless of outcome
-        zip_path = os.path.join(DOCS, "export_ci_check.zip")
-        if os.path.exists(zip_path):
-            os.remove(zip_path)
+        with _export_lock():
+            result = subprocess.run(
+                [npx, "--yes", "mintlify@4.2.632", "export", "--output", zip_name],
+                cwd=DOCS,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
 
         combined = (result.stdout or "") + (result.stderr or "")
 
@@ -264,6 +294,10 @@ def _() -> list[str]:
         return ["npx not found — skipping Mintlify export check (Node.js required)"]
     except subprocess.TimeoutExpired:
         return ["mintlify export timed out after 300 s"]
+    finally:
+        # Clean up the zip on every path, including failure.
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
 
 
 # ── Summary ───────────────────────────────────────────────────────────────────
