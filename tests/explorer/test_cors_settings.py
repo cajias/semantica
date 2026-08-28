@@ -30,8 +30,11 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
+from semantica.context.context_graph import ContextGraph
+from semantica.context.snapshot import SNAPSHOT_URI_ENV
 from semantica.explorer.app import create_app
-from semantica.utils import cors
+from semantica.explorer.session import GraphSession
+from semantica.utils import cors, security_headers
 
 ORIGIN_ENV_NAMES = (cors.CANONICAL_ORIGINS_ENV,) + cors.DEPRECATED_ORIGINS_ENV
 CREDENTIAL_ENV_NAMES = (
@@ -77,11 +80,20 @@ def _explorer_options():
     return _cors_options(create_app())
 
 
-def _server_options():
-    """CORS options of ``semantica.server`` re-imported under the current env."""
+def _server_app():
+    """``semantica.server``'s app, re-imported under the current environment.
+
+    Its ``app`` is a module-level object built at import time, so a test that
+    sets an environment variable has to reload the module to be read honestly.
+    """
     import semantica.server
 
-    return _cors_options(importlib.reload(semantica.server).app)
+    return importlib.reload(semantica.server).app
+
+
+def _server_options():
+    """CORS options of ``semantica.server`` re-imported under the current env."""
+    return _cors_options(_server_app())
 
 
 class TestCanonicalName:
@@ -366,6 +378,107 @@ class TestWildcardOrigin:
         )
 
 
+class TestWildcardReachesTheWebSocketHandshake:
+    """The WS Origin gate must read ``*`` the way the HTTP layer does.
+
+    ``CORSMiddleware`` does not cover WebSocket handshakes, so
+    ``/ws/graph-updates`` checks ``Origin`` against the same resolved list by
+    hand. A literal ``"*"`` matches no real ``Origin`` header, so testing it as
+    an ordinary list entry left ``SEMANTICA_CORS_ORIGINS=*`` wide open over
+    HTTP while refusing *every* browser on the socket -- including the
+    deployment's own page, whose live graph updates then silently never
+    connect, with only a 4403 close to show for it.
+    """
+
+    def test_wildcard_accepts_an_arbitrary_origin(self, monkeypatch):
+        """GIVEN origins are set to *
+        WHEN a handshake arrives from an unrelated origin
+        THEN it is accepted, as the HTTP layer already accepts it."""
+        monkeypatch.setenv(cors.CANONICAL_ORIGINS_ENV, "*")
+
+        with TestClient(create_app()) as client:
+            with client.websocket_connect(
+                "/ws/graph-updates", headers={"Origin": "https://anywhere.example"}
+            ) as websocket:
+                ack = websocket.receive_json()
+
+        assert ack["event"] == "connection_ack", (
+            "the wildcard is honoured for HTTP, so refusing it here makes the "
+            "Explorer's own page unable to open its socket"
+        )
+
+    def test_a_concrete_list_still_rejects_a_foreign_origin(self, monkeypatch):
+        """GIVEN origins name one concrete host
+        WHEN a handshake arrives from another origin
+        THEN it is still refused (GHSA-4643-wpgq-w329)."""
+        monkeypatch.setenv(cors.CANONICAL_ORIGINS_ENV, "https://kg.example.com")
+
+        with TestClient(create_app()) as client:
+            with pytest.raises(Exception):
+                with client.websocket_connect(
+                    "/ws/graph-updates", headers={"Origin": "https://evil.example"}
+                ):
+                    pass
+
+
+class TestPreloadedGraphOutranksTheSnapshot:
+    """``--graph`` must not be silently replaced by ``SEMANTICA_SNAPSHOT_URI``.
+
+    ``semantica-explorer --graph`` loads the file, prints its node and edge
+    counts, and hands the session to ``create_app``. The lifespan then used to
+    restore the snapshot over it unconditionally, so the operator was told
+    "loaded N nodes" and served something else entirely.
+    """
+
+    def test_a_preloaded_graph_is_not_clobbered_and_the_skip_is_logged(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """GIVEN a session whose graph is already populated and a snapshot URI
+        WHEN the app starts
+        THEN the snapshot is not restored and a warning names the URI."""
+        snapshot = ContextGraph(advanced_analytics=False)
+        snapshot.add_node("from_snapshot", node_type="concept", content="Ambient")
+        path = tmp_path / "snapshot.json"
+        snapshot.save_to_file(str(path))
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, str(path))
+
+        preloaded = ContextGraph(advanced_analytics=False)
+        preloaded.add_node("from_cli", node_type="concept", content="--graph")
+        app = create_app(session=GraphSession(preloaded))
+
+        with caplog.at_level(logging.WARNING):
+            with TestClient(app) as client:
+                nodes = client.get("/api/graph/nodes").json()
+
+        assert {node["id"] for node in nodes["nodes"]} == {"from_cli"}, (
+            "the graph the operator passed on the command line was replaced by "
+            "ambient snapshot state"
+        )
+        assert SNAPSHOT_URI_ENV in caplog.text and str(path) in caplog.text, (
+            "overriding the configured snapshot silently leaves the operator "
+            "with no way to explain which graph is being served"
+        )
+
+    def test_an_empty_session_graph_still_restores(self, tmp_path, monkeypatch):
+        """GIVEN a session with an empty graph and a snapshot URI
+        WHEN the app starts
+        THEN the snapshot is restored exactly as before."""
+        snapshot = ContextGraph(advanced_analytics=False)
+        snapshot.add_node("from_snapshot", node_type="concept", content="Ambient")
+        path = tmp_path / "snapshot.json"
+        snapshot.save_to_file(str(path))
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, str(path))
+
+        app = create_app(session=GraphSession(ContextGraph(advanced_analytics=False)))
+
+        with TestClient(app) as client:
+            nodes = client.get("/api/graph/nodes").json()
+
+        assert {node["id"] for node in nodes["nodes"]} == {
+            "from_snapshot"
+        }, "no --graph was passed, so the snapshot is the only graph there is"
+
+
 class TestCredentials:
     """One credentials flag, one default, both entry points."""
 
@@ -504,3 +617,62 @@ class TestBothEntryPointsAgree:
             "semantica/server.py resolves CORS itself instead of calling "
             "semantica.utils.cors.resolve_cors_settings"
         )
+
+
+def _response_headers(app, path, **kwargs):
+    """Headers of a GET to *path*, without running the app's lifespan.
+
+    No ``with``: neither health route needs lifespan state, and skipping it
+    keeps the snapshot machinery out of a middleware test.
+    """
+    return TestClient(app).get(path, **kwargs).headers
+
+
+class TestSecurityHeadersReachBothEntryPoints:
+    """The same paired-edit hazard as CORS, one middleware over.
+
+    ``semantica/explorer/app.py`` is what the Docker image and the App Runner
+    service run, so headers installed only on ``semantica/server.py`` are
+    headers the internet-facing app does not send.
+    """
+
+    def test_both_apps_send_the_static_headers(self):
+        """GIVEN each entry point's app
+        WHEN a request is served
+        THEN both carry every shared security header."""
+        explorer = _response_headers(create_app(), "/api/health")
+        server = _response_headers(_server_app(), "/health")
+
+        for name, value in security_headers.STATIC_SECURITY_HEADERS.items():
+            assert explorer[name] == value, (
+                "semantica/explorer/app.py does not send {} -- this is the app "
+                "the container and App Runner run".format(name)
+            )
+            assert server[name] == value, "semantica-server does not send {}".format(
+                name
+            )
+
+    @pytest.mark.parametrize("entry_point", ["explorer", "server"])
+    def test_hsts_follows_the_client_facing_scheme(self, entry_point):
+        """GIVEN a request behind a TLS-terminating proxy
+        WHEN it is served over plain HTTP
+        THEN HSTS is sent on the forwarded-https request and only that one.
+
+        ``request.url.scheme`` is ``http`` on every deployed request, App
+        Runner included, so keying HSTS off it alone never fires.
+        """
+        if entry_point == "explorer":
+            app, path = create_app(), "/api/health"
+        else:
+            app, path = _server_app(), "/health"
+
+        plain = _response_headers(app, path)
+        forwarded = _response_headers(app, path, headers={"X-Forwarded-Proto": "https"})
+
+        assert security_headers.HSTS_HEADER not in plain, (
+            "HSTS on a plain-HTTP response is ignored by browsers and hides a "
+            "misconfigured proxy"
+        )
+        assert (
+            forwarded[security_headers.HSTS_HEADER] == security_headers.HSTS_VALUE
+        ), "HSTS never fires behind a TLS terminator if it only reads url.scheme"

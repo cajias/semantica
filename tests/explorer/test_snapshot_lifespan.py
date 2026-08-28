@@ -214,6 +214,47 @@ class TestServerRestore:
             with TestClient(_server_app()):
                 pass
 
+    def test_the_snapshot_hook_does_not_disable_index_maintenance(
+        self, tmp_path, monkeypatch
+    ):
+        """GIVEN semantica.server running with snapshots enabled
+        WHEN a node is written through the session after start-up
+        THEN search finds it and the graph revision has advanced.
+
+        ``SnapshotService.start()`` installs its dirty hook into
+        ``ContextGraph.mutation_callback``, and GraphSession reads an occupied
+        slot as "someone else bumps the revision and maintains the search
+        index" (``session.py`` ``add_nodes`` and friends). Unless the lifespan
+        installs the session's own handler *first*, so the snapshot hook chains
+        onto it, nobody does that work: writes stay invisible to
+        /api/graph/search and the stale embedding cache is never invalidated.
+        """
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, str(tmp_path / "snapshot.json"))
+        app = _server_app()
+
+        with TestClient(app) as client:
+            session = app.state.session
+            revision_before = session._graph_revision
+            session.add_nodes(
+                [
+                    {
+                        "id": "liveedit",
+                        "type": "concept",
+                        "content": "Added while running",
+                    }
+                ]
+            )
+            revision_after = session._graph_revision
+            results = client.post(
+                "/api/graph/search", json={"query": "liveedit"}
+            ).json()
+
+        assert [item["node"]["id"] for item in results["results"]] == ["liveedit"]
+        assert revision_after > revision_before, (
+            "the graph revision never advanced, so get_cached_embeddings keeps "
+            "serving vectors from before the write"
+        )
+
 
 def _node_ids(path):
     """Node ids in the snapshot at *path*."""
@@ -326,23 +367,27 @@ class TestShutdownSnapshot:
     def test_a_failing_final_write_does_not_break_explorer_shutdown(
         self, tmp_path, monkeypatch, caplog
     ):
-        """GIVEN a destination that cannot be written
+        """GIVEN a store whose save raises
         WHEN the Explorer app shuts down with a dirty graph
         THEN shutdown completes and the failure is logged at ERROR.
+
+        The save is made to raise rather than the destination made unwritable:
+        chmod is no obstacle to a process holding CAP_DAC_OVERRIDE, so under
+        root -- as in most CI images and Docker-based dev -- the write would
+        quietly succeed and this test would fail for having nothing to log.
         """
-        unwritable = tmp_path / "unwritable"
-        unwritable.mkdir()
-        unwritable.chmod(0o500)
-        monkeypatch.setenv(SNAPSHOT_URI_ENV, str(unwritable / "snapshot.json"))
+
+        def _failing_save(self, graph):
+            raise OSError("no space left on device")
+
+        monkeypatch.setenv(SNAPSHOT_URI_ENV, str(tmp_path / "snapshot.json"))
+        monkeypatch.setattr(SnapshotStore, "save", _failing_save)
         app = _explorer_app()
 
-        try:
-            with caplog.at_level("ERROR"):
-                with TestClient(app):
-                    app.state.session.graph.add_node(
-                        "doomed", node_type="concept", content="Never stored"
-                    )
-        finally:
-            unwritable.chmod(0o700)
+        with caplog.at_level("ERROR"):
+            with TestClient(app):
+                app.state.session.graph.add_node(
+                    "doomed", node_type="concept", content="Never stored"
+                )
 
         assert "snapshot to" in caplog.text
