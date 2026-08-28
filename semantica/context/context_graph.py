@@ -1106,7 +1106,7 @@ class ContextGraph:
                 )
             )
 
-    def save_to_file(self, path: str) -> None:
+    def save_to_file(self, path: str, mode: Optional[int] = None) -> None:
         """
         Save context graph to file (JSON format).
 
@@ -1115,6 +1115,10 @@ class ContextGraph:
 
         Args:
             path: File path to save to
+            mode: Permission bits to enforce on the written file. Left None the
+                file keeps the mode it had, or gets the umask default when new;
+                pass ``0o600`` when the destination holds a whole graph an
+                operator would not want world-readable.
         """
         import json
         import os
@@ -1148,7 +1152,7 @@ class ContextGraph:
         # os.replace swaps the final path component, so resolve symlinks first
         # to keep writing *through* a symlinked snapshot path the way
         # open(path, "w") did instead of replacing the link with a regular file.
-        with atomic_replace(os.path.realpath(path)) as f:
+        with atomic_replace(os.path.realpath(path), mode) as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         self.logger.info(f"Saved context graph to {path}")

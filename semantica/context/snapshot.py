@@ -25,6 +25,7 @@ larger graph fails ``ENOSPC`` on every interval tick -- safely, but forever.
 
 import contextlib
 import os
+import shutil
 import tempfile
 import threading
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
@@ -35,12 +36,14 @@ from ..utils.logging import get_logger
 try:
     # No stubs are shipped and types-boto3 would be a new dependency.
     import boto3  # type: ignore[import-untyped]
+    from botocore.config import Config  # type: ignore[import-untyped]
     from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
     BOTO3_AVAILABLE = True
 except (ImportError, OSError):  # native wheels fail with OSError, not ImportError
     BOTO3_AVAILABLE = False
     boto3 = None
+    Config = None
     ClientError = None
 
 SNAPSHOT_URI_ENV = "SEMANTICA_SNAPSHOT_URI"
@@ -56,6 +59,11 @@ _S3_SCHEME = "s3://"
 # no code at all. NoSuchBucket is *also* a 404, so absence is decided on the
 # code, never on the status.
 _ABSENT_OBJECT_CODES = ("NoSuchKey", "404")
+# botocore generates ``client.exceptions.NoSuchKey`` as a ClientError subclass,
+# so one type covers every absence. The OSError stand-in is unreachable in
+# practice -- _s3() raises before the try block when botocore is missing -- and
+# exists only to keep the except clause a valid type.
+_S3_ERRORS = ClientError if ClientError is not None else OSError
 
 logger = get_logger("context_snapshot")
 
@@ -71,14 +79,9 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
     return bucket, key
 
 
-def _is_absent_object(error: BaseException) -> bool:
+def _is_absent_object(error: Any) -> bool:
     """True when *error* means the snapshot object does not exist yet."""
-    response = getattr(error, "response", None)
-    if not isinstance(response, dict):
-        # A stub may raise a bare ``client.exceptions.NoSuchKey`` with no
-        # response payload attached.
-        return type(error).__name__ == "NoSuchKey"
-    code = response.get("Error", {}).get("Code")
+    code = error.response.get("Error", {}).get("Code")
     return code in _ABSENT_OBJECT_CODES
 
 
@@ -154,16 +157,27 @@ class SnapshotStore:
             if not BOTO3_AVAILABLE:
                 raise ProcessingError(
                     "S3 snapshots need boto3, an optional dependency: install "
-                    "semantica[cloud] (requested destination: {})".format(
+                    "semantica[snapshot-s3] (requested destination: {})".format(
                         self.description
                     )
                 )
-            self._client = boto3.client("s3")
+            # botocore's defaults are 60s connect, 60s read and 5 attempts:
+            # ~5 minutes against a blackholed or wrong-region endpoint, which
+            # restore() spends stalling container boot and stop() spends waiting
+            # on the write lock, long past STOP_JOIN_TIMEOUT.
+            self._client = boto3.client(
+                "s3",
+                config=Config(
+                    connect_timeout=5,
+                    read_timeout=STOP_JOIN_TIMEOUT,
+                    retries={"max_attempts": 2},
+                ),
+            )
         return self._client
 
     def _load_file(self, graph: Any, path: str) -> bool:
         if not os.path.exists(path):
-            logger.info("no snapshot at %s; starting with an empty graph", path)
+            logger.warning("no snapshot file at %s; starting with an empty graph", path)
             return False
         graph.load_from_file(path)
         logger.info("restored context graph from %s", path)
@@ -174,21 +188,22 @@ class SnapshotStore:
         # freshly mounted volume legitimately starts empty: first run, not
         # permanent failure.
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        graph.save_to_file(path)
+        # 0600, not the umask default: this one file is the whole graph --
+        # nodes, decisions, policies, precedents, retractions -- at an
+        # operator-configured path, rewritten every interval. agent_memory.py
+        # already writes its strictly smaller Markdown owner-only.
+        graph.save_to_file(path, mode=0o600)
 
     def _load_object(self, graph: Any) -> bool:
         client = self._s3()
         try:
             response = client.get_object(Bucket=self.bucket, Key=self.key)
-            body = response["Body"].read()
-        # The tuple is assembled and checked by _absent_object_errors; mypy
-        # cannot verify a runtime-computed except clause.
-        except self._absent_object_errors(client) as error:  # type: ignore[misc]
+        except _S3_ERRORS as error:
             if not _is_absent_object(error):
                 # AccessDenied, NoSuchBucket, a throttle: raise, per the
                 # asymmetry in the module docstring.
                 raise
-            logger.info(
+            logger.warning(
                 "no snapshot object at %s; starting with an empty graph",
                 self.description,
             )
@@ -197,7 +212,10 @@ class SnapshotStore:
         with tempfile.TemporaryDirectory() as staging:
             staged = os.path.join(staging, "snapshot.json")
             with open(staged, "wb") as handle:
-                handle.write(body)
+                # Streamed, not read() into a bytes object first: the staging
+                # copy is already charged against a possibly-tmpfs TMPDIR, and
+                # buffering the whole object doubles the peak.
+                shutil.copyfileobj(response["Body"], handle)
             # A corrupt or truncated body raises out of here, deliberately.
             graph.load_from_file(staged)
         logger.info("restored context graph from %s", self.description)
@@ -220,21 +238,6 @@ class SnapshotStore:
             with open(staged, "rb") as handle:
                 client.put_object(Bucket=self.bucket, Key=self.key, Body=handle)
         logger.info("wrote context graph snapshot to %s", self.description)
-
-    @staticmethod
-    def _absent_object_errors(client: Any) -> Tuple[type, ...]:
-        """Exception types a missing object can arrive as.
-
-        ``client.exceptions.NoSuchKey`` is a ``ClientError`` subclass in
-        botocore, but a stub need not be, so both are named.
-        """
-        errors = []
-        no_such_key = getattr(getattr(client, "exceptions", None), "NoSuchKey", None)
-        if isinstance(no_such_key, type):
-            errors.append(no_such_key)
-        if ClientError is not None:
-            errors.append(ClientError)
-        return tuple(errors) or (OSError,)
 
 
 def snapshot_store_from_env(
@@ -287,9 +290,11 @@ def suspended_mutations(graph: Any) -> Iterator[None]:
     dirty.
 
     ``ContextGraph._suspend_mutation_callback`` is a plain boolean flag despite
-    the name, not a context manager. This is the shared form of the save/set/
-    restore that ``change_management/managers.py`` writes out by hand. The
-    *previous* value is restored, not False, so nesting works.
+    the name, not a context manager. This is the one save/set/restore shared by
+    the two callers that replay a whole graph: ``SnapshotService.restore`` here
+    and ``TemporalVersionManager.restore_snapshot`` in
+    ``change_management/managers.py``. The *previous* value is restored, not
+    False, so nesting works.
     """
     previous = getattr(graph, "_suspend_mutation_callback", False)
     graph._suspend_mutation_callback = True
@@ -371,7 +376,12 @@ class SnapshotService:
         store = self._store
         if store is None:
             return False
-        logger.info("context graph snapshots: %s", store.description)
+        # WARNING, not INFO: neither explorer/app.py nor the semantica-explorer
+        # console script configures logging, so under uvicorn's dictConfig the
+        # root logger falls back to logging.lastResort at WARNING and every INFO
+        # record is dropped -- including which destination is in use and, below,
+        # that the process is booting with an empty graph.
+        logger.warning("context graph snapshots: %s", store.description)
         with suspended_mutations(self._graph):
             restored = store.load(self._graph)
         if restored and self._after_restore is not None:
@@ -383,8 +393,19 @@ class SnapshotService:
 
         Returns self, so a lifespan can build and start in one statement.
         """
-        if self._store is None or self._thread is not None:
+        # is_alive(), not "is not None": stop() keeps the reference when its
+        # bounded join times out, precisely so this guard can see a writer that
+        # is still running and refuse to start a second one beside it. Since
+        # _stop is cleared just below, that second writer would not exit --
+        # two threads would serialise one graph to one destination.
+        if self._store is None or (
+            self._thread is not None and self._thread.is_alive()
+        ):
             return self
+        # stop() sets the event permanently, so without this a start-after-stop
+        # spawns a thread whose first wait() returns True and exits -- while
+        # start() logs that it is snapshotting on an interval.
+        self._stop.clear()
         self._mark_dirty_on_mutation()
         # A daemon thread rather than an asyncio task: the save is blocking
         # network I/O that would stall the event loop, asyncio.to_thread is
@@ -418,10 +439,13 @@ class SnapshotService:
             if thread.is_alive():
                 # Only a warning: the write lock, not this join, is what keeps
                 # the final snapshot ordered after an upload still in flight.
+                # The reference is *kept* so start()'s is_alive() guard can see
+                # this zombie and refuse to run a second writer beside it.
                 logger.warning(
                     "snapshot writer did not stop within %ss", STOP_JOIN_TIMEOUT
                 )
-            self._thread = None
+            else:
+                self._thread = None
         self._restore_mutation_callback()
         # snapshot_if_dirty logs a failure at ERROR and returns rather than
         # raising: an exception here would escape into the lifespan's teardown

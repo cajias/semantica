@@ -13,6 +13,8 @@ from semantica.context import snapshot as snapshot_module
 from semantica.context.context_graph import ContextGraph
 from semantica.context.snapshot import SnapshotService
 
+WRITER_THREAD_NAME = "semantica-snapshot-writer"
+
 
 class FakeStore:
     """Counts saves. ``on_save`` runs inside the save, before it returns."""
@@ -68,6 +70,28 @@ class OrderRecordingStore:
             # then completes last, carrying the stale payload.
             self.second_started.wait(timeout=1.0)
         self.completed.append(payload)
+
+
+class StuckThread:
+    """Stands in for a writer that outlives ``stop()``'s bounded join.
+
+    A genuinely stuck writer cannot be used: it is stuck *inside* the write
+    lock, so ``stop()``'s own final snapshot would queue behind it forever and
+    the test could never reach ``start()``. What is under test is the state
+    ``stop()`` leaves behind when the join times out, which is exactly this.
+    """
+
+    daemon = True
+    name = WRITER_THREAD_NAME
+
+    def __init__(self):
+        self.joins = 0
+
+    def is_alive(self):
+        return True
+
+    def join(self, timeout=None):
+        self.joins += 1
 
 
 def _graph():
@@ -276,6 +300,72 @@ class TestThreadBehaviour:
         thread.join(timeout=2)
         assert not thread.is_alive()
         assert service._thread is None
+
+    def test_a_restarted_service_still_ticks(self, monkeypatch):
+        """GIVEN a service that was stopped
+        WHEN it is started again and the graph is mutated
+        THEN the writer thread is alive and the mutation reaches a snapshot.
+
+        ``stop()`` sets the stop event permanently, so a ``start()`` that does
+        not clear it spawns a thread whose first ``wait()`` returns True at once:
+        the thread exits while ``start()`` logs that it is snapshotting on an
+        interval, and the interval guarantee is silently gone.
+        """
+        graph = _graph()
+        store = FakeStore()
+        service = _started(graph, store, monkeypatch, interval=0.02)
+        _add(graph, "before_stop")
+        service.stop()
+
+        wrote = threading.Event()
+        store.on_save = lambda _graph: wrote.set()
+        service.start()
+        try:
+            _add(graph, "after_restart")
+
+            assert wrote.wait(timeout=5), "the restarted writer never ticked"
+            thread = service._thread
+            assert thread is not None and thread.is_alive()
+        finally:
+            service.stop()
+
+        assert store.saved_node_counts[-1] == 2
+
+    def test_start_after_a_timed_out_stop_adds_no_second_writer(
+        self, monkeypatch, caplog
+    ):
+        """GIVEN stop()'s bounded join timed out with the writer still running
+        WHEN the service is started again
+        THEN no second writer is spawned and the old one is still tracked.
+
+        start() clears the stop event, so a second writer would not exit on its
+        first wait(): two threads would then serialise the same graph to the
+        same destination concurrently. Dropping the thread reference on a
+        timed-out join is what would let that happen.
+        """
+        graph = _graph()
+        monkeypatch.setattr(snapshot_module, "snapshot_interval_from_env", lambda: 3600)
+        monkeypatch.setattr(snapshot_module, "STOP_JOIN_TIMEOUT", 0.01)
+        service = SnapshotService(graph, FakeStore())
+        zombie = StuckThread()
+        service._thread = zombie
+
+        with caplog.at_level("WARNING"):
+            service.stop()
+
+        assert zombie.joins == 1, "stop() did not even try to join the writer"
+        assert service._thread is zombie, (
+            "stop() dropped a writer that was still running, so start() can no "
+            "longer see it"
+        )
+        assert "did not stop" in caplog.text
+
+        before = [t for t in threading.enumerate() if t.name == WRITER_THREAD_NAME]
+        service.start()
+        after = [t for t in threading.enumerate() if t.name == WRITER_THREAD_NAME]
+
+        assert after == before, "a second writer was started beside the first"
+        assert service._thread is zombie
 
     def test_the_graph_lock_is_free_during_a_save(self, monkeypatch, tmp_path):
         """GIVEN a save in progress on another thread

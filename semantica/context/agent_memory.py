@@ -1752,8 +1752,9 @@ class AgentMemory:
         # The helper replaces the directory entry, so a raced symlink is
         # replaced rather than followed. 0600 rather than the helper's
         # umask-derived default: memory holds whatever the agent was told to
-        # remember, so on a shared host or multi-uid container a new memory file
-        # must not be world-readable. This is what NamedTemporaryFile +
+        # remember, so on a shared host or multi-uid container a memory file
+        # must not be world-readable, including when an overwrite finds one that
+        # already is. This is what NamedTemporaryFile +
         # os.replace gave these files before the writer was shared.
         atomic_write_text(file_path, document, mode=0o600)
 

@@ -49,7 +49,7 @@ except (ImportError, OSError):  # pragma: no cover - exercised only without boto
     Stubber = None
 
 requires_boto3 = pytest.mark.skipif(
-    not BOTO3_INSTALLED, reason="boto3/botocore are optional (semantica[cloud])"
+    not BOTO3_INSTALLED, reason="boto3/botocore are optional (semantica[snapshot-s3])"
 )
 
 BUCKET = "graphs-bucket"
@@ -232,17 +232,24 @@ class TestLocalSnapshots:
     def test_missing_snapshot_yields_an_empty_graph(self, tmp_path, caplog):
         """GIVEN no file at the snapshot path -- the first ever deployment,
         THEN ``load`` returns False, the graph is untouched, and nothing raises.
+
+        Captured at WARNING on purpose: neither ``explorer/app.py`` nor the
+        ``semantica-explorer`` console script configures logging, so under
+        uvicorn's dictConfig every INFO record from this module is discarded.
+        At INFO this line would be invisible in exactly the deployment that
+        needs it, and the next interval tick would overwrite the real snapshot
+        with the empty graph nobody was told about.
         """
         store = snapshot.SnapshotStore(str(tmp_path / "absent.json"))
         graph = ContextGraph(advanced_analytics=False)
 
-        with caplog.at_level(logging.INFO):
+        with caplog.at_level(logging.WARNING):
             assert store.load(graph) is False
 
         assert graph.nodes == {} and graph.edges == []
         assert "empty graph" in caplog.text.lower(), (
-            "a first-run start-up produced no log line explaining why the graph "
-            "is empty"
+            "a first-run start-up produced no log line at WARNING or above "
+            "explaining why the graph is empty"
         )
 
     def test_save_creates_a_missing_parent_directory(self, tmp_path):
@@ -296,6 +303,36 @@ class TestLocalSnapshots:
 
         with pytest.raises(expected):
             store.load(graph)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    def test_the_snapshot_file_is_owner_only(self, tmp_path):
+        """GIVEN a filesystem snapshot destination,
+        THEN the file lands 0600 and a plain ``save_to_file`` is unaffected.
+
+        The snapshot is the entire graph -- nodes, decisions, policies,
+        precedents, retractions -- at an operator-configured path, rewritten
+        every interval. ``agent_memory`` already writes its strictly smaller
+        Markdown owner-only, so the umask default here was an inconsistency in
+        the less-safe direction on the more sensitive file. The library call
+        keeps the umask default: the 0600 is the snapshot's opt-in, not a
+        behaviour change for every existing caller.
+        """
+        snapshot_path = tmp_path / "snapshot.json"
+        library_path = tmp_path / "library.json"
+        umask_default = tmp_path / "umask_default.json"
+        umask_default.write_text("{}")
+
+        snapshot.SnapshotStore(str(snapshot_path)).save(_seeded_graph())
+        _seeded_graph().save_to_file(str(library_path))
+
+        assert os.stat(str(snapshot_path)).st_mode & 0o777 == 0o600, (
+            "the whole context graph is world-readable at a path the operator "
+            "configured, rewritten every interval"
+        )
+        assert (
+            os.stat(str(library_path)).st_mode & 0o777
+            == os.stat(str(umask_default)).st_mode & 0o777
+        ), "the snapshot's 0600 opt-in leaked into the general save_to_file path"
 
     def test_description_names_the_local_path(self, tmp_path):
         """GIVEN a filesystem store,
@@ -389,6 +426,10 @@ class TestS3Snapshots:
     def test_a_missing_object_yields_an_empty_graph(self, caplog):
         """GIVEN no snapshot object yet -- the first ever deployment,
         THEN ``load`` returns False, the graph is empty, and nothing raises.
+
+        Captured at WARNING for the same reason as the filesystem twin: a wrong
+        key inside a readable bucket is the one misconfiguration that boots an
+        empty graph without raising, so it has to be audible where INFO is not.
         """
         client = _s3_client()
         store = snapshot.SnapshotStore(URI, client=client)
@@ -399,11 +440,15 @@ class TestS3Snapshots:
                 "get_object", service_error_code="NoSuchKey", http_status_code=404
             )
 
-            with caplog.at_level(logging.INFO):
+            with caplog.at_level(logging.WARNING):
                 assert store.load(graph) is False
 
         assert graph.nodes == {} and graph.edges == []
         assert "empty graph" in caplog.text.lower()
+        assert URI in caplog.text, (
+            "the warning does not name the destination that came up empty: "
+            + caplog.text
+        )
 
     @pytest.mark.parametrize(
         "code,status",
@@ -454,6 +499,69 @@ class TestS3Snapshots:
 
             with pytest.raises(json.JSONDecodeError):
                 store.load(graph)
+
+    def test_the_body_is_streamed_to_the_staging_file(self, tmp_path, monkeypatch):
+        """GIVEN an object body,
+        WHEN it is restored,
+        THEN it is copied in chunks rather than read into memory whole.
+
+        Peak usage on this path is otherwise a full heap copy *plus* the staging
+        copy plus the parsed graph, on a path whose staging directory may be a
+        64 MB tmpfs and in a container pinned at 2 GB. The fake body fails the
+        unbounded ``read()`` that buffering needs, so this fails loudly rather
+        than only under memory pressure.
+        """
+        original = _seeded_graph(4, "s3-streamed")
+        payload = _snapshot_bytes(original, tmp_path / "reference.json")
+        client = _s3_client()
+        store = snapshot.SnapshotStore(URI, client=client)
+        restored = ContextGraph(advanced_analytics=False)
+
+        class ChunkedBody:
+            def __init__(self, data):
+                self._buffer = io.BytesIO(data)
+
+            def read(self, amount=-1):
+                if amount is None or amount < 0:
+                    raise AssertionError(
+                        "the whole object was read into memory before staging it"
+                    )
+                return self._buffer.read(amount)
+
+        def get_object(**_kwargs):
+            return {"Body": ChunkedBody(payload)}
+
+        # Not Stubber: it validates the response against the service model, so
+        # a body that is not a StreamingBody cannot be injected through it.
+        monkeypatch.setattr(client, "get_object", get_object)
+
+        assert store.load(restored) is True
+        assert sorted(restored.nodes) == sorted(original.nodes)
+
+    def test_the_s3_client_is_built_with_a_timeout_budget(self, monkeypatch):
+        """GIVEN no pre-built client,
+        THEN the one this module builds carries explicit timeouts and retries.
+
+        botocore's defaults are 60 s connect, 60 s read and five attempts: about
+        five minutes against a blackholed or wrong-region endpoint. ``restore()``
+        runs before either lifespan yields, so that is five minutes of stalled
+        container boot; at shutdown the same budget is spent holding the write
+        lock that ``stop()``'s final snapshot queues behind, far past
+        ``STOP_JOIN_TIMEOUT``.
+        """
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+        store = snapshot.SnapshotStore(URI)
+
+        config = store._s3().meta.config
+
+        attempts = config.retries.get("total_max_attempts", 5)
+        worst_case = attempts * (config.connect_timeout + config.read_timeout)
+        assert worst_case <= 60, (
+            "the S3 client's worst case against a dead endpoint is {}s, so both "
+            "boot and shutdown can stall for it".format(worst_case)
+        )
 
     def test_the_graph_lock_is_free_while_the_upload_runs(self, monkeypatch):
         """GIVEN a save in progress,
@@ -529,7 +637,7 @@ class TestS3WithoutBoto3:
         """
         monkeypatch.setattr(snapshot, "BOTO3_AVAILABLE", False)
         store = snapshot.SnapshotStore(URI)
-        expected = re.escape("semantica[cloud]")
+        expected = re.escape("semantica[snapshot-s3]")
 
         with pytest.raises(ProcessingError, match=expected):
             store.save(_seeded_graph())
@@ -615,6 +723,14 @@ class TestEnvironmentConfiguration:
             assert (
                 "SEMANTICA_SNAPSHOT_INTERVAL" in caplog.text
             ), "an unusable interval was silently replaced by the default"
+        else:
+            # A blank value is an *unset* optional knob, not a misconfiguration:
+            # the early return exists so the default deployment does not carry a
+            # warning in every start-up log.
+            assert caplog.text == "", (
+                "a blank interval warned as though it were misconfigured: "
+                "{!r}".format(caplog.text)
+            )
 
     def test_the_environment_defaults_to_os_environ(self, monkeypatch, tmp_path):
         """GIVEN no explicit mapping,

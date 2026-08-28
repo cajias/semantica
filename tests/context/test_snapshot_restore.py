@@ -120,6 +120,28 @@ class TestRestore:
         with pytest.raises(ValidationError):
             SnapshotService.from_env(None)
 
+    def test_the_destination_is_logged_above_info(self, tmp_path, caplog):
+        """GIVEN a configured destination
+        WHEN the service restores
+        THEN the destination is named at WARNING or above.
+
+        ``explorer/app.py`` and the ``semantica-explorer`` console script never
+        configure logging, so under uvicorn's dictConfig the root logger has no
+        handler and every INFO record from this module is dropped. At INFO the
+        operator of the deployed service cannot see where -- or whether -- the
+        graph is being persisted.
+        """
+        path = _written_snapshot(tmp_path)
+        graph = ContextGraph(advanced_analytics=False)
+
+        with caplog.at_level(logging.WARNING):
+            assert SnapshotService(graph, SnapshotStore(path)).restore() is True
+
+        assert path in caplog.text, (
+            "the snapshot destination was logged below WARNING, where the "
+            "deployed Explorer discards it: " + caplog.text
+        )
+
     def test_corrupt_snapshot_raises(self, tmp_path):
         """GIVEN a corrupt snapshot payload
         WHEN the service restores

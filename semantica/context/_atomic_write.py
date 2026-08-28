@@ -5,7 +5,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
-from typing import IO, Iterator, Union
+from typing import IO, Iterator, Optional, Union
 
 
 def _default_file_mode() -> int:
@@ -23,7 +23,7 @@ _DEFAULT_FILE_MODE = _default_file_mode()
 
 @contextlib.contextmanager
 def atomic_replace(
-    path: Union[str, Path], mode: int = _DEFAULT_FILE_MODE
+    path: Union[str, Path], mode: Optional[int] = None
 ) -> Iterator[IO[str]]:
     """Yield a writable temp file whose content replaces *path* atomically.
 
@@ -38,10 +38,11 @@ def atomic_replace(
 
     Args:
         path: Destination to replace.
-        mode: Permission bits for a *new* file. Defaults to what a plain
-            ``open(path, "w")`` would give, which is right for a snapshot an
-            operator reads and wrong for anything private -- pass ``0o600``
-            for that. An existing destination keeps its own mode either way.
+        mode: Permission bits to enforce, applied whether or not the
+            destination already exists -- pass ``0o600`` for anything private.
+            When omitted, an existing destination keeps its own mode and a new
+            one gets what a plain ``open(path, "w")`` would have given, which
+            is what a snapshot an operator reads wants.
     """
     file_path = os.fspath(path)
     # The temp file must share a filesystem with the destination or os.replace
@@ -67,12 +68,18 @@ def atomic_replace(
             os.fsync(temporary_file.fileno())
 
         # tempfile creates at 0600 and os.replace carries the temp file's mode
-        # onto the destination. Keep an existing destination's permission bits,
-        # masked to 0o777 because a plain write would not have propagated
-        # setuid/setgid/sticky; a new file gets the caller's requested mode.
-        try:
-            final_mode = stat.S_IMODE(os.stat(file_path).st_mode) & 0o777
-        except OSError:
+        # onto the destination. Without an explicit mode, keep an existing
+        # destination's permission bits, masked to 0o777 because a plain write
+        # would not have propagated setuid/setgid/sticky, and fall back to the
+        # umask default for a new file. An explicit mode always wins: a caller
+        # asking for 0600 means it, including when overwriting a 0644 file
+        # left behind by an older build, a restore, or a tarball.
+        if mode is None:
+            try:
+                final_mode = stat.S_IMODE(os.stat(file_path).st_mode) & 0o777
+            except OSError:
+                final_mode = _DEFAULT_FILE_MODE
+        else:
             final_mode = mode
         os.chmod(temporary_path, final_mode)
 
@@ -84,7 +91,7 @@ def atomic_replace(
 
 
 def atomic_write_text(
-    path: Union[str, Path], text: str, mode: int = _DEFAULT_FILE_MODE
+    path: Union[str, Path], text: str, mode: Optional[int] = None
 ) -> None:
     """Write *text* to *path* via a temp file in the same directory + os.replace."""
     with atomic_replace(path, mode) as temporary_file:

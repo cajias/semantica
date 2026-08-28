@@ -715,6 +715,42 @@ def test_a_new_markdown_memory_file_is_owner_only(tmp_path):
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_overwriting_a_world_readable_markdown_memory_file_restores_0600(tmp_path):
+    """GIVEN a memory file already on disk at 0644,
+    WHEN it is exported over,
+    THEN it ends up 0600.
+
+    A 0644 memory file is what a build predating the 0600 export produced under
+    a 022 umask, and what a tarball restore, image ``COPY`` or operator
+    ``touch`` still produces. If the rewrite only tightened *new* files, the
+    disclosure would survive every re-export.
+    """
+    memory = AgentMemory()
+    memory.store(
+        "The staging database password hint is the dog's name",
+        metadata={"type": "note", "updated_at": "2026-07-22T10:00:00"},
+        memory_id="mem_private",
+        timestamp=datetime(2026, 7, 22, 9, 0, 0),
+    )
+    destination = tmp_path / "export"
+
+    memory.export(format="markdown", destination=destination)
+    exported = sorted(destination.glob("*.md"))
+    assert exported, "nothing was exported"
+    for path in exported:
+        os.chmod(str(path), 0o644)
+
+    memory.export(format="markdown", destination=destination)
+
+    for path in exported:
+        mode = stat.S_IMODE(os.stat(str(path)).st_mode)
+        assert mode == 0o600, (
+            f"{path.name} stayed {oct(mode)} across the overwrite; a memory file "
+            "left world-readable by an older build is never repaired"
+        )
+
+
 def test_empty_markdown_export_and_import_are_no_ops():
     memory = AgentMemory()
 

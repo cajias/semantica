@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from semantica.context._atomic_write import _DEFAULT_FILE_MODE
+from semantica.context._atomic_write import _DEFAULT_FILE_MODE, atomic_replace
 from semantica.context.context_graph import ContextGraph
 
 
@@ -243,7 +243,6 @@ class TestSuccessfulSave:
         assert len(payload["nodes"]) == 5
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
 class TestSerializedPayloadIsDetached:
     """``save_to_file`` builds its payload under the lock, then dumps it outside.
 
@@ -287,6 +286,7 @@ class TestSerializedPayloadIsDetached:
         assert "added_during_dump" not in payload["properties"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
 class TestSnapshotPermissions:
     """``os.replace`` carries the *source* file's mode onto the destination.
 
@@ -328,6 +328,29 @@ class TestSnapshotPermissions:
             "plain open() would have created under this umask"
         )
         assert _DEFAULT_FILE_MODE & 0o600, "the writer cannot read back its own file"
+
+    def test_a_modeless_atomic_replace_preserves_the_destination(self, tmp_path):
+        """GIVEN a file at 0640 and an ``atomic_replace`` call with no ``mode``,
+        THEN the rewrite keeps 0640.
+
+        ``mode`` now overrides the destination unconditionally so that
+        ``agent_memory``'s 0600 survives an overwrite; the snapshot caller at
+        ``context_graph.py:1151`` passes no mode and must keep the old
+        preserve-what-is-there contract.
+        """
+        path = tmp_path / "operator.json"
+        path.write_text("old", encoding="utf-8")
+        os.chmod(str(path), 0o640)
+
+        with atomic_replace(str(path)) as handle:
+            handle.write("new")
+
+        assert path.read_text(encoding="utf-8") == "new"
+        mode = stat.S_IMODE(os.stat(str(path)).st_mode)
+        assert mode == 0o640, (
+            "a mode-less atomic_replace changed the destination from 0o640 to "
+            f"{oct(mode)}"
+        )
 
     def test_setgid_is_not_propagated(self, tmp_path):
         """GIVEN an existing snapshot carrying setgid,
