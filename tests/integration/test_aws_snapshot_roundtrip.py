@@ -1,17 +1,32 @@
 """Container-restart round-trip harness for the Explorer graph snapshot.
 
-Answers one question the codebase currently has no way to observe: does the
-knowledge graph survive a container restart?
+Answers the one question no in-process test can: does the knowledge graph
+survive losing the container it lived in? The Explorer keeps its graph in an
+in-memory ``ContextGraph`` owned by ``GraphSession``, so durability rests
+entirely on ``SEMANTICA_SNAPSHOT_URI`` -- and the unit tests drive that through
+a lifespan in the same process, never through a real image on a real volume.
 
-These tests are EXPECTED TO BE RED until the snapshot work lands (atomic
-write, snapshot store, startup restore, interval writer, shutdown snapshot).
-The Explorer keeps its graph in an in-memory ``ContextGraph`` owned by
-``GraphSession``, so today the graph dies with the process and nothing ever
-reads or writes ``SEMANTICA_SNAPSHOT_URI``. Being honestly red is the point.
+One test per snapshot moment:
+
+* ``test_graph_survives_container_restart`` seeds a node pair and an edge
+  through ``POST /api/import``, destroys the container while keeping the named
+  volume, brings a new one up and reads both back. The graceful ``down`` sends
+  SIGTERM, so the shutdown snapshot is the moment this proves end to end.
+* ``test_interval_writer_survives_sigkill`` isolates the interval writer by
+  denying the shutdown path: it waits for a tick to put the snapshot object on
+  the volume, writes a second node pair, then SIGKILLs the container and
+  asserts exit 137. The pre-tick data must come back and the post-tick data
+  must not -- HLD section 5's bounded loss, asserted rather than tolerated.
+* ``test_starts_with_empty_graph_when_no_snapshot_exists`` covers startup
+  restore on a first-ever deploy: an empty volume must yield a healthy
+  container serving an empty graph, never a fatal error.
 
 Every test runs against the real image through ``docker compose``, under an
 isolated compose project name so a failed run can never remove a developer's
-own containers or volumes.
+own containers or volumes. The prerequisites -- docker on PATH, a reachable
+daemon, compose v2, and a free host port 8000 -- are probed and *skip* rather
+than fail: a machine that cannot run containers has learned nothing about
+persistence, so a red result there would be noise.
 """
 
 import json
