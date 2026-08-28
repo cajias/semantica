@@ -152,6 +152,8 @@ This writes the compiled assets to `../semantica/static/`. The Python server the
 | `SEMANTICA_CORS_CREDENTIALS` | `false` | Set to `true` to allow credentialed cross-origin requests (only needed behind an authenticating reverse proxy). Deprecated alias: `EXPLORER_CORS_CREDENTIALS`. |
 | `SEMANTICA_API_KEY` | *(unset)* | API key required on protected routes since v0.6.5; send it as the `X-API-Key` header. When unset, protected routes fail closed with `503`. |
 | `SEMANTICA_ALLOW_ANONYMOUS` | `false` | Set to `true` to opt into unauthenticated access (local development only). |
+| `SEMANTICA_SNAPSHOT_URI` | *(unset)* | Destination for periodic context-graph snapshots: an `s3://bucket/key` URI (needs `boto3` installed) or a plain filesystem path. Unset means snapshots are disabled and the in-memory graph is lost on exit. When set, an existing snapshot at the destination is restored into the graph at start-up, replacing what was loaded from disk. Any other URI scheme is rejected at start-up rather than treated as a path. |
+| `SEMANTICA_SNAPSHOT_INTERVAL` | `30` | Seconds between snapshots when the graph has changed — the data-loss budget for an unclean exit. Only consulted when `SEMANTICA_SNAPSHOT_URI` is set; a value that is not a positive whole number warns and falls back to `30`. |
 
 ---
 

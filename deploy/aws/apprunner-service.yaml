@@ -30,8 +30,8 @@ Parameters:
     Description: >-
       ECR image URI, e.g.
       <AWS-ACCOUNT-ID>.dkr.ecr.<REGION>.amazonaws.com/semantica-explorer:latest.
-      The image must carry boto3, which the stock Dockerfile does not install -
-      see README.md before building.
+      The image must carry boto3, which the stock Dockerfile installs with the
+      snapshot-s3 extra.
 
   AccessRoleArn:
     Type: String
@@ -65,9 +65,11 @@ Parameters:
   AllowedOrigins:
     Type: String
     Description: >-
-      Comma-separated browser origins allowed by CORS. Set this to the
-      deployment's real domain - the application default names localhost and
-      would reject the deployed UI.
+      Comma-separated browser origins for the CORS allowlist and the WebSocket
+      Origin check. The bundled UI is same-origin, so this only matters to
+      cross-origin API callers and to the /ws/graph-updates handshake, which
+      rejects any Origin not named here. Set it to the deployment's real domain;
+      the application default names localhost.
 
   ApiKeySecretArn:
     Type: String
@@ -131,7 +133,10 @@ Resources:
                 Value: !Ref SnapshotUri
               - Name: SEMANTICA_SNAPSHOT_INTERVAL
                 Value: !Ref SnapshotInterval
-              - Name: ALLOWED_ORIGINS
+              # Canonical name. ALLOWED_ORIGINS is still read but deprecated,
+              # and the image bakes it into its ENV - setting the canonical name
+              # here outranks that and keeps the deprecation warning off the log.
+              - Name: SEMANTICA_CORS_ORIGINS
                 Value: !Ref AllowedOrigins
             # A missing SEMANTICA_API_KEY makes every protected route answer 503.
             # It does not fall back to anonymous access, so this is required, and

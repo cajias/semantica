@@ -101,6 +101,8 @@ The `semantica-explorer` command accepts exactly four flags:
 
 <Note>
   There are no flags for authentication, CORS, or log level in the CLI. CORS allowed origins are configured via the `SEMANTICA_CORS_ORIGINS` environment variable (comma-separated, default: `http://localhost:5173,http://127.0.0.1:5173`). The older `ALLOWED_ORIGINS` and `EXPLORER_CORS_ORIGINS` names are still honoured, in that order of precedence, but log a deprecation warning naming their replacement. `semantica-server` reads the same variable, so both entry points allow the same origins.
+
+  Graph persistence is environment-only too. `SEMANTICA_SNAPSHOT_URI` (default unset) names a snapshot destination — an `s3://bucket/key` URI, which needs `boto3` installed, or a plain filesystem path; any other URI scheme is rejected at start-up rather than treated as a path. Unset means snapshots are disabled and the in-memory graph is lost when the process exits. When it is set, an existing snapshot at that destination is restored into the graph at start-up, replacing the graph loaded from `--graph`. `SEMANTICA_SNAPSHOT_INTERVAL` (default `30`) is the number of seconds between snapshots of a changed graph — the data-loss budget for an unclean exit; a value that is not a positive whole number warns and falls back to `30`. `semantica-server` reads both variables identically.
 </Note>
 
 <Tip>

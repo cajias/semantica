@@ -15,16 +15,10 @@ are based on source code. You can't use configuration files with image-based
 services." This repo ships a `Dockerfile`, so the service is image-based and is
 declared as CloudFormation in `apprunner-service.yaml`.
 
-**Before building, add `boto3` to the image.** The `Dockerfile` installs
-`.[explorer]`, which does not include `boto3`; it lives in the `cloud` extra. An
-`s3://` snapshot URI on the stock image fails at the first snapshot with
-`S3 snapshots need boto3, an optional dependency: install semantica[cloud]`.
-Change the one line:
-
-```diff
--RUN pip install --no-cache-dir ".[explorer]" \
-+RUN pip install --no-cache-dir ".[explorer,cloud]" \
-```
+The `Dockerfile` installs `.[explorer,snapshot-s3]`, so the stock image already
+carries `boto3` and an `s3://` snapshot URI works unmodified. Without `boto3` the
+restore runs before uvicorn finishes starting, so the failure is at start-up,
+before the service ever becomes healthy — not a degraded running service.
 
 ```bash
 export AWS_REGION=<REGION>
@@ -39,6 +33,21 @@ aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION" \
   --create-bucket-configuration LocationConstraint="$AWS_REGION"
 aws s3api put-bucket-versioning --bucket "$BUCKET" \
   --versioning-configuration Status=Enabled
+#    Versioning without expiry grows forever: the writer rewrites the whole graph
+#    to the same key on every dirty tick, so a 30-second interval retains 120
+#    noncurrent versions an hour and never prunes one. NoncurrentDays=7 covers the
+#    realistic mistake — a bad merge or import noticed the same week — and bounds
+#    nothing else: the bound is 7 days of write volume, not a version count.
+#    Continuous editing at the default 30-second interval accrues on the order of
+#    20,000 whole-graph copies before the oldest is even eligible to expire, so
+#    size the bucket as one snapshot times that. SEMANTICA_SNAPSHOT_INTERVAL is
+#    the only knob that changes the churn. NewerNoncurrentVersions is left out on
+#    purpose: S3 expires a noncurrent version only once it is both older than
+#    NoncurrentDays *and* has more newer noncurrent versions than that value, so
+#    it is a retention floor, never a cap — setting it can only keep more.
+aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" \
+  --lifecycle-configuration \
+  '{"Rules":[{"ID":"expire-old-snapshots","Status":"Enabled","Filter":{"Prefix":""},"NoncurrentVersionExpiration":{"NoncurrentDays":7}}]}'
 aws s3api put-public-access-block --bucket "$BUCKET" \
   --public-access-block-configuration \
   BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
@@ -79,15 +88,15 @@ aws iam create-role --role-name semantica-explorer-access \
 aws iam attach-role-policy --role-name semantica-explorer-access \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
 
-# 5. Image, built from the repo root with the boto3 edit above applied.
+# 5. Image, built from the repo root.
 aws ecr create-repository --repository-name semantica-explorer
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com"
 docker build -t "$IMAGE" .
 docker push "$IMAGE"
 
-# 6. Service. ALLOWED_ORIGINS needs the public URL, which does not exist yet —
-#    use your custom domain, or re-run this with the ServiceUrl output once it does.
+# 6. Service. SEMANTICA_CORS_ORIGINS needs the public URL, which does not exist
+#    yet — use your custom domain, or re-run this with the ServiceUrl output.
 aws cloudformation deploy \
   --template-file deploy/aws/apprunner-service.yaml \
   --stack-name semantica-explorer \
@@ -107,8 +116,21 @@ outage, not an open door. Pass the same value as the `X-API-Key` header from any
 client that talks to the deployed API. Never set `SEMANTICA_ALLOW_ANONYMOUS` here;
 it is the development opt-out and it disables that check.
 
-`ALLOWED_ORIGINS` must name the real deployment domain. Left at its default it
-names `localhost`, and the browser will refuse the deployed UI's own requests.
+**The bundled browser UI cannot send that key, so this stack serves the REST API,
+not the Explorer.** The shipped frontend sends no `X-API-Key` header and no
+`?api_key=` query parameter on its WebSocket, so with a key set every data panel
+shows `HTTP 401` and the live-update socket closes with 4401 — while `/`,
+`/assets` and `/api/health` stay unauthenticated, so the App Runner health check
+reports the service healthy throughout. Drive the deployment from REST clients,
+or put an authenticating reverse proxy in front that injects `X-API-Key` on
+requests and `?api_key=` on the WebSocket upgrade. Do not reach for
+`SEMANTICA_ALLOW_ANONYMOUS` to make the UI work: that publishes the graph.
+
+`SEMANTICA_CORS_ORIGINS` must name the real deployment domain. It governs the CORS
+allowlist for cross-origin API callers and the `Origin` check on the
+`/ws/graph-updates` handshake; the bundled UI is served from the same origin, so
+CORS never applies to its own fetches. Left at its `localhost` default, the
+WebSocket rejects the deployed page's Origin.
 
 **The container gets an IAM role, not access keys.** App Runner has two service
 roles and they are easy to conflate: the *access* role
@@ -117,8 +139,7 @@ while the *instance* role (`tasks.apprunner.amazonaws.com`,
 `InstanceConfiguration.InstanceRoleArn`) supplies credentials to the running
 container for "AWS service actions that your service's compute instances need".
 The second one is what step 3 creates, so this deployment holds no long-lived
-secret access key. Section 6 of the design doc says otherwise; the design doc is
-wrong on this point and should be corrected.
+secret access key. Section 6 of the design doc records the same reasoning.
 
 That role is scoped to one object: `s3:GetObject` and `s3:PutObject` on
 `arn:aws:s3:::<YOUR-BUCKET>/<KEY>`, not on the bucket and not on a prefix. It also
