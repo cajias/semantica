@@ -501,12 +501,12 @@ class TemporalVersionManager(BaseVersionManager):
         entities, relationships = self._extract_graph_collections(snapshot)
         graph_payload = {"nodes": entities, "edges": relationships}
 
-        previous_state = getattr(graph, "_suspend_mutation_callback", False)
-        graph._suspend_mutation_callback = True
-        try:
+        # Imported here, not at module scope: semantica.context.agent_context
+        # imports this package back, so a top-level import would be a cycle.
+        from ..context.snapshot import suspended_mutations
+
+        with suspended_mutations(graph):
             graph.from_dict(graph_payload)
-        finally:
-            graph._suspend_mutation_callback = previous_state
         
         self.logger.info(f"Successfully restored graph to version '{target_version}'.")
         return True
