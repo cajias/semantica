@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 532" width="940" height="532" font-family="Helvetica, Arial, sans-serif">
+  <rect width="940" height="532" fill="#fbfbfd"/>
+  <text x="470" y="34" text-anchor="middle" font-size="19" font-weight="600" fill="#1a202c">Runtime data flow</text>
+  <text x="470" y="56" text-anchor="middle" font-size="13" fill="#4a5568">a change reaches the record, and the next boot reads it back</text>
+
+  <text x="20" y="88" font-size="11.5" font-weight="600" fill="#2b6cb0" letter-spacing="0.5">1. THE WRITE PATH</text>
+
+  <!-- write path -->
+  <rect x="20" y="100" width="135" height="80" rx="6" fill="#ffffff" stroke="#4a5568" stroke-width="1.6"/>
+  <text x="30" y="116" font-size="10" font-weight="600" fill="#718096">1</text>
+  <text x="87" y="134" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">a change arrives</text>
+  <text x="87" y="153" text-anchor="middle" font-size="10" fill="#4a5568">an HTTP route reaches</text>
+  <text x="87" y="168" text-anchor="middle" font-size="10" fill="#4a5568">the shared write path</text>
+
+  <path d="M 155 140 L 171 140" stroke="#2b6cb0" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-blue)"/>
+
+  <rect x="173" y="100" width="135" height="80" rx="6" fill="#ebf4ff" stroke="#2b6cb0" stroke-width="1.6"/>
+  <text x="183" y="116" font-size="10" font-weight="600" fill="#2b6cb0">2</text>
+  <text x="240" y="134" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">the chain fans out</text>
+  <text x="240" y="153" text-anchor="middle" font-size="10" fill="#4a5568">every listener runs,</text>
+  <text x="240" y="168" text-anchor="middle" font-size="10" fill="#4a5568">outside the graph lock</text>
+
+  <path d="M 308 140 L 324 140" stroke="#2b6cb0" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-blue)"/>
+
+  <rect x="326" y="100" width="135" height="80" rx="6" fill="#ebf4ff" stroke="#2b6cb0" stroke-width="1.6"/>
+  <text x="336" y="116" font-size="10" font-weight="600" fill="#2b6cb0">3</text>
+  <text x="393" y="134" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">the mark is set</text>
+  <text x="393" y="153" text-anchor="middle" font-size="10" fill="#4a5568">one boolean, however</text>
+  <text x="393" y="168" text-anchor="middle" font-size="10" fill="#4a5568">many changes land</text>
+
+  <path d="M 461 140 L 477 140" stroke="#2b6cb0" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-blue)"/>
+
+  <rect x="479" y="100" width="135" height="80" rx="6" fill="#ebf4ff" stroke="#2b6cb0" stroke-width="1.6"/>
+  <text x="489" y="116" font-size="10" font-weight="600" fill="#2b6cb0">4</text>
+  <text x="546" y="134" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">a tick, or a stop</text>
+  <text x="546" y="153" text-anchor="middle" font-size="10" fill="#4a5568">the interval elapses,</text>
+  <text x="546" y="168" text-anchor="middle" font-size="10" fill="#4a5568">or a stop is signalled</text>
+
+  <path d="M 614 140 L 630 140" stroke="#2b6cb0" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-blue)"/>
+
+  <rect x="632" y="100" width="135" height="80" rx="6" fill="#fffaf0" stroke="#b7791f" stroke-width="1.8"/>
+  <text x="642" y="116" font-size="10" font-weight="600" fill="#b7791f">5</text>
+  <text x="699" y="134" text-anchor="middle" font-size="11.5" font-weight="600" fill="#744210">the mark clears</text>
+  <text x="699" y="153" text-anchor="middle" font-size="10" fill="#744210">before the write, so a</text>
+  <text x="699" y="168" text-anchor="middle" font-size="10" fill="#744210">late edit is not lost</text>
+
+  <path d="M 767 140 L 783 140" stroke="#2f855a" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-green)"/>
+
+  <rect x="785" y="100" width="135" height="80" rx="6" fill="#f0fff4" stroke="#2f855a" stroke-width="2"/>
+  <text x="795" y="116" font-size="10" font-weight="600" fill="#2f855a">6</text>
+  <text x="852" y="134" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">the record lands</text>
+  <text x="852" y="153" text-anchor="middle" font-size="10" fill="#4a5568">serialized, then put</text>
+  <text x="852" y="168" text-anchor="middle" font-size="10" fill="#4a5568">as one whole object</text>
+
+  <!-- one boot later -->
+  <path d="M 852 180 L 852 196 L 240 196 L 240 224" stroke="#2f855a" stroke-width="1.8" fill="none" stroke-dasharray="5 4" marker-end="url(#snapshot-dataflow-green)"/>
+  <text x="550" y="190" text-anchor="middle" font-size="10.5" font-weight="600" fill="#2f855a">the same record, one boot later</text>
+
+  <text x="20" y="218" font-size="11.5" font-weight="600" fill="#2f855a" letter-spacing="0.5">2. THE RESTART PATH</text>
+
+  <!-- restart path -->
+  <rect x="20" y="226" width="135" height="80" rx="6" fill="#ffffff" stroke="#4a5568" stroke-width="1.6"/>
+  <text x="30" y="242" font-size="10" font-weight="600" fill="#718096">1</text>
+  <text x="87" y="260" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">the process boots</text>
+  <text x="87" y="279" text-anchor="middle" font-size="10" fill="#4a5568">a new container with</text>
+  <text x="87" y="294" text-anchor="middle" font-size="10" fill="#4a5568">an empty graph</text>
+
+  <path d="M 155 266 L 171 266" stroke="#2f855a" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-green)"/>
+
+  <rect x="173" y="226" width="135" height="80" rx="6" fill="#f0fff4" stroke="#2f855a" stroke-width="2"/>
+  <text x="183" y="242" font-size="10" font-weight="600" fill="#2f855a">2</text>
+  <text x="240" y="260" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">the record is read</text>
+  <text x="240" y="279" text-anchor="middle" font-size="10" fill="#4a5568">one read, at start-up;</text>
+  <text x="240" y="294" text-anchor="middle" font-size="10" fill="#4a5568">absent means empty</text>
+
+  <path d="M 308 266 L 324 266" stroke="#2f855a" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-green)"/>
+
+  <rect x="326" y="226" width="135" height="80" rx="6" fill="#ffffff" stroke="#2f855a" stroke-width="1.6"/>
+  <text x="336" y="242" font-size="10" font-weight="600" fill="#2f855a">3</text>
+  <text x="393" y="260" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">a silent replay</text>
+  <text x="393" y="279" text-anchor="middle" font-size="10" fill="#4a5568">the chain is suspended</text>
+  <text x="393" y="294" text-anchor="middle" font-size="10" fill="#4a5568">so nothing is marked</text>
+
+  <path d="M 461 266 L 477 266" stroke="#2f855a" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-green)"/>
+
+  <rect x="479" y="226" width="135" height="80" rx="6" fill="#ffffff" stroke="#2f855a" stroke-width="1.6"/>
+  <text x="489" y="242" font-size="10" font-weight="600" fill="#2f855a">4</text>
+  <text x="546" y="260" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">the index rebuilds</text>
+  <text x="546" y="279" text-anchor="middle" font-size="10" fill="#4a5568">derived state catches</text>
+  <text x="546" y="294" text-anchor="middle" font-size="10" fill="#4a5568">up with the graph</text>
+
+  <path d="M 614 266 L 630 266" stroke="#2f855a" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-green)"/>
+
+  <rect x="632" y="226" width="135" height="80" rx="6" fill="#fffaf0" stroke="#b7791f" stroke-width="1.8"/>
+  <text x="642" y="242" font-size="10" font-weight="600" fill="#b7791f">5</text>
+  <text x="699" y="260" text-anchor="middle" font-size="11.5" font-weight="600" fill="#744210">the writer starts</text>
+  <text x="699" y="279" text-anchor="middle" font-size="10" fill="#744210">after the restore, not</text>
+  <text x="699" y="294" text-anchor="middle" font-size="10" fill="#744210">before it</text>
+
+  <path d="M 767 266 L 783 266" stroke="#2f855a" stroke-width="2" fill="none" marker-end="url(#snapshot-dataflow-green)"/>
+
+  <rect x="785" y="226" width="135" height="80" rx="6" fill="#f0fff4" stroke="#2f855a" stroke-width="2"/>
+  <text x="795" y="242" font-size="10" font-weight="600" fill="#2f855a">6</text>
+  <text x="852" y="260" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a202c">serving resumes</text>
+  <text x="852" y="279" text-anchor="middle" font-size="10" fill="#4a5568">at exactly the last</text>
+  <text x="852" y="294" text-anchor="middle" font-size="10" fill="#4a5568">completed write</text>
+
+  <!-- the two orderings that are decisions -->
+  <rect x="20" y="328" width="444" height="88" rx="9" fill="#fffaf0" stroke="#b7791f" stroke-width="1.5"/>
+  <text x="40" y="352" font-size="12" font-weight="600" fill="#744210" letter-spacing="0.5">WHY THE MARK IS CLEARED FIRST</text>
+  <text x="40" y="374" font-size="11.5" fill="#744210">A change landing between the clear and the completion</text>
+  <text x="40" y="392" font-size="11.5" fill="#744210">re-marks the graph and rides the next tick. Clearing</text>
+  <text x="40" y="410" font-size="11.5" fill="#744210">afterwards would swallow that edit until a later one.</text>
+
+  <rect x="476" y="328" width="444" height="88" rx="9" fill="#fffaf0" stroke="#b7791f" stroke-width="1.5"/>
+  <text x="496" y="352" font-size="12" font-weight="600" fill="#744210" letter-spacing="0.5">WHY THE WRITER STARTS AFTER THE RESTORE</text>
+  <text x="496" y="374" font-size="11.5" fill="#744210">The replay leaves the graph reading as saved, so the</text>
+  <text x="496" y="392" font-size="11.5" fill="#744210">first tick does not immediately write back a record</text>
+  <text x="496" y="410" font-size="11.5" fill="#744210">identical to the one it has just read.</text>
+
+  <!-- what the path does not cover -->
+  <rect x="20" y="436" width="900" height="76" rx="9" fill="#ffffff" stroke="#718096" stroke-width="1.5"/>
+  <text x="40" y="460" font-size="12" font-weight="600" fill="#4a5568" letter-spacing="0.5">WHAT THIS PATH DOES NOT COVER</text>
+  <text x="40" y="482" font-size="12.5" fill="#4a5568">Between one step 6 and the next, the only copy of a change is in one process's memory.</text>
+  <text x="40" y="502" font-size="12.5" fill="#4a5568">An abrupt kill that skips the stop signal loses everything written since the last completed write.</text>
+
+  <defs>
+    <marker id="snapshot-dataflow-blue" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto"><path d="M0,0 L0,7 L9,3.5 z" fill="#2b6cb0"/></marker>
+    <marker id="snapshot-dataflow-green" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto"><path d="M0,0 L0,7 L9,3.5 z" fill="#2f855a"/></marker>
+  </defs>
+</svg>

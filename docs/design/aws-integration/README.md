@@ -6,6 +6,14 @@
 
 ---
 
+**Companion document.** The durability mechanism this deployment rests on — capturing the
+in-memory graph outside the process and restoring it at start-up, which Section 5 describes from the
+hosting side — carries its own design in `snapshot-persistence.md`, next to this file. Read that for
+the mechanism's capabilities, the decisions behind them, and the C4 levels of the subsystem itself;
+this document covers only what the hosting arrangement asks of it.
+
+---
+
 ## 1. Purpose
 
 This document describes how the Semantica Knowledge Explorer is intended to run on
@@ -242,7 +250,11 @@ cheaper option is also the safer one, which is not usually how that trade runs.
 **Versioning turns every snapshot into a restore point.** With object versioning
 enabled, the successive snapshots are retained rather than overwritten, so recovery
 from a bad edit is a matter of selecting an earlier version. This is the closest
-thing to a backup strategy the design has, and it costs almost nothing.
+thing to a backup strategy the design has, and it is cheap only because a lifecycle
+rule expires noncurrent versions after seven days. Left unbounded it is not cheap:
+every snapshot is a full copy of the graph, so seven days of thirty-second writes is
+on the order of twenty thousand copies retained. The snapshot interval, not the
+retention rule, is what sets that count.
 
 **A redeployment is not the clean hand-over it appears to be.** App Runner temporarily
 doubles the provisioned instances during a deployment, so that old and new code hold

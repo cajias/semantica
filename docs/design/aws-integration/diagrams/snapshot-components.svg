@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 716" width="940" height="716" font-family="Helvetica, Arial, sans-serif">
+  <rect width="940" height="716" fill="#fbfbfd"/>
+  <text x="470" y="34" text-anchor="middle" font-size="19" font-weight="600" fill="#1a202c">Components and the single announcement slot</text>
+  <text x="470" y="56" text-anchor="middle" font-size="13" fill="#4a5568">one callback attribute, held by the listener installed last, reaching back to the one before it</text>
+
+  <!-- the chain -->
+  <rect x="20" y="96" width="536" height="424" rx="12" fill="#ffffff" stroke="#2b6cb0" stroke-width="2.2" stroke-dasharray="7 5"/>
+  <text x="34" y="120" font-size="11.5" font-weight="600" fill="#2b6cb0" letter-spacing="0.5">THE ANNOUNCEMENT CHAIN</text>
+  <text x="34" y="136" font-size="10.5" fill="#718096">read top to bottom, the order the announcement travels</text>
+
+  <!-- contender that assigns rather than chains -->
+  <rect x="34" y="146" width="130" height="54" rx="6" fill="#fffaf0" stroke="#b7791f" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text x="99" y="165" text-anchor="middle" font-size="10.5" font-weight="600" fill="#744210">change-management</text>
+  <text x="99" y="180" text-anchor="middle" font-size="10.5" font-weight="600" fill="#744210">recorder</text>
+  <text x="99" y="194" text-anchor="middle" font-size="10" fill="#b7791f">assigns the slot</text>
+
+  <path d="M 164 196 L 177 234" stroke="#b7791f" stroke-width="1.6" fill="none" stroke-dasharray="4 3" marker-end="url(#snapshot-components-amber)"/>
+  <text x="155" y="225" text-anchor="end" font-size="10" fill="#b7791f">same slot</text>
+
+  <!-- reading order rail -->
+  <text x="34" y="262" font-size="10" font-weight="600" fill="#718096" letter-spacing="0.5">REACHED IN ORDER</text>
+  <text x="34" y="280" font-size="10" fill="#718096">the slot holder first,</text>
+  <text x="34" y="294" font-size="10" fill="#718096">then what it calls on</text>
+  <text x="155" y="325" text-anchor="end" font-size="10.5" fill="#718096">first</text>
+  <text x="155" y="401" text-anchor="end" font-size="10.5" fill="#718096">second</text>
+  <text x="155" y="481" text-anchor="end" font-size="10.5" fill="#718096">third</text>
+
+  <!-- fire site -->
+  <rect x="180" y="146" width="362" height="50" rx="6" fill="#ffffff" stroke="#4a5568" stroke-width="1.6"/>
+  <text x="361" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#1a202c">ContextGraph shared write path</text>
+  <text x="361" y="186" text-anchor="middle" font-size="10.5" fill="#4a5568">announces after releasing the graph lock</text>
+
+  <path d="M 361 196 L 361 214" stroke="#4a5568" stroke-width="1.8" fill="none" marker-end="url(#snapshot-components-ink)"/>
+  <text x="374" y="210" font-size="10" fill="#718096">fires once per change</text>
+
+  <!-- the slot -->
+  <rect x="180" y="218" width="362" height="48" rx="6" fill="#fffaf0" stroke="#b7791f" stroke-width="2"/>
+  <text x="361" y="239" text-anchor="middle" font-size="13" font-weight="600" fill="#744210">mutation_callback</text>
+  <text x="361" y="257" text-anchor="middle" font-size="10.5" fill="#744210">one attribute, not a listener list</text>
+
+  <path d="M 361 266 L 361 284" stroke="#b7791f" stroke-width="1.8" fill="none" marker-end="url(#snapshot-components-amber)"/>
+  <text x="374" y="280" font-size="10" fill="#718096">whoever installed last</text>
+
+  <!-- occupant, installed last -->
+  <rect x="180" y="288" width="362" height="58" rx="6" fill="#ebf4ff" stroke="#2b6cb0" stroke-width="2"/>
+  <text x="361" y="309" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1a202c">SnapshotService dirty hook</text>
+  <text x="361" y="326" text-anchor="middle" font-size="10.5" fill="#4a5568">installed last, so it holds the slot</text>
+  <text x="361" y="341" text-anchor="middle" font-size="10" fill="#718096">sets the unsaved mark, then calls on</text>
+
+  <path d="M 361 346 L 361 364" stroke="#2b6cb0" stroke-width="1.8" fill="none" marker-end="url(#snapshot-components-blue)"/>
+  <text x="374" y="360" font-size="10" fill="#718096">calls its predecessor</text>
+
+  <!-- middle link -->
+  <rect x="180" y="368" width="362" height="58" rx="6" fill="#f0fff4" stroke="#2f855a" stroke-width="2"/>
+  <text x="361" y="389" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1a202c">GraphSession index maintainer</text>
+  <text x="361" y="406" text-anchor="middle" font-size="10.5" fill="#4a5568">the bridge calls it before broadcasting</text>
+  <text x="361" y="421" text-anchor="middle" font-size="10" fill="#718096">upserts the index, bumps the revision</text>
+
+  <path d="M 361 426 L 361 444" stroke="#2b6cb0" stroke-width="1.8" fill="none" marker-end="url(#snapshot-components-blue)"/>
+  <text x="374" y="440" font-size="10" fill="#718096">back in the same bridge</text>
+
+  <!-- end of chain -->
+  <rect x="180" y="448" width="362" height="58" rx="6" fill="#ebf4ff" stroke="#2b6cb0" stroke-width="2"/>
+  <text x="361" y="469" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1a202c">WebSocket broadcast</text>
+  <text x="361" y="486" text-anchor="middle" font-size="10.5" fill="#4a5568">the explorer entry point only</text>
+  <text x="361" y="501" text-anchor="middle" font-size="10" fill="#718096">reached last, so it ends the chain</text>
+
+  <!-- slot to modules -->
+  <path d="M 556 317 L 616 317" stroke="#2b6cb0" stroke-width="2" fill="none" marker-end="url(#snapshot-components-blue)"/>
+  <text x="587" y="307" text-anchor="middle" font-size="10" font-weight="600" fill="#2b6cb0">the mark</text>
+  <text x="587" y="331" text-anchor="middle" font-size="10" fill="#718096">set</text>
+
+  <!-- modules -->
+  <rect x="620" y="96" width="300" height="424" rx="12" fill="#ffffff" stroke="#2f855a" stroke-width="2.2" stroke-dasharray="7 5"/>
+  <text x="634" y="120" font-size="11.5" font-weight="600" fill="#2f855a" letter-spacing="0.5">SUBSYSTEM MODULES</text>
+  <text x="634" y="136" font-size="10.5" fill="#718096">one process, three modules</text>
+
+  <rect x="634" y="146" width="272" height="120" rx="7" fill="#f0fff4" stroke="#2f855a" stroke-width="2"/>
+  <text x="770" y="170" text-anchor="middle" font-size="13" font-weight="600" fill="#1a202c">SnapshotService</text>
+  <text x="770" y="190" text-anchor="middle" font-size="10.5" fill="#4a5568">one unsaved mark, one boolean</text>
+  <text x="770" y="207" text-anchor="middle" font-size="10.5" fill="#4a5568">an interval writer thread</text>
+  <text x="770" y="224" text-anchor="middle" font-size="10.5" fill="#4a5568">a write lock over the destination</text>
+  <text x="770" y="241" text-anchor="middle" font-size="10.5" fill="#4a5568">restore, then start, then stop</text>
+  <text x="770" y="258" text-anchor="middle" font-size="10" fill="#718096">a failed write leaves the mark set</text>
+
+  <rect x="634" y="280" width="272" height="104" rx="7" fill="#ffffff" stroke="#2f855a" stroke-width="1.6"/>
+  <text x="770" y="304" text-anchor="middle" font-size="13" font-weight="600" fill="#1a202c">SnapshotStore</text>
+  <text x="770" y="324" text-anchor="middle" font-size="10.5" fill="#4a5568">one destination, two families</text>
+  <text x="770" y="341" text-anchor="middle" font-size="10.5" fill="#4a5568">load and save through the graph's</text>
+  <text x="770" y="358" text-anchor="middle" font-size="10.5" fill="#4a5568">own serializer, so both match</text>
+  <text x="770" y="375" text-anchor="middle" font-size="10" fill="#718096">its description omits credentials</text>
+
+  <rect x="634" y="398" width="272" height="106" rx="7" fill="#ffffff" stroke="#2f855a" stroke-width="1.6"/>
+  <text x="770" y="422" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1a202c">Environment readers</text>
+  <text x="770" y="442" text-anchor="middle" font-size="10.5" fill="#4a5568">SEMANTICA_SNAPSHOT_URI</text>
+  <text x="770" y="459" text-anchor="middle" font-size="10.5" fill="#4a5568">SEMANTICA_SNAPSHOT_INTERVAL</text>
+  <text x="770" y="476" text-anchor="middle" font-size="10.5" fill="#4a5568">read once, at construction</text>
+  <text x="770" y="495" text-anchor="middle" font-size="10" fill="#718096">an unusable interval warns once</text>
+
+  <!-- variant -->
+  <rect x="20" y="534" width="444" height="74" rx="9" fill="#ffffff" stroke="#718096" stroke-width="1.5"/>
+  <text x="40" y="558" font-size="12" font-weight="600" fill="#4a5568" letter-spacing="0.5">THE TWO-LINK VARIANT</text>
+  <text x="40" y="580" font-size="11.5" fill="#4a5568">semantica-server has no live-update route, so it installs</text>
+  <text x="40" y="598" font-size="11.5" fill="#4a5568">the index maintainer directly: two links, same property.</text>
+
+  <rect x="476" y="534" width="444" height="74" rx="9" fill="#ffffff" stroke="#2f855a" stroke-width="1.5"/>
+  <text x="496" y="558" font-size="12" font-weight="600" fill="#2f855a" letter-spacing="0.5">A RESTORE SILENCES THE CHAIN</text>
+  <text x="496" y="580" font-size="11.5" fill="#4a5568">A restore replays every node through the write path, so the</text>
+  <text x="496" y="598" font-size="11.5" fill="#4a5568">chain is suspended for its duration and nothing is marked.</text>
+
+  <!-- hazard -->
+  <rect x="20" y="622" width="900" height="74" rx="9" fill="#fffaf0" stroke="#b7791f" stroke-width="1.5"/>
+  <text x="40" y="646" font-size="12" font-weight="600" fill="#744210" letter-spacing="0.5">HOW THE CHAIN BREAKS</text>
+  <text x="40" y="668" font-size="12.5" fill="#744210">A listener that assigns the slot instead of capturing its occupant silences everyone installed before it.</text>
+  <text x="40" y="688" font-size="12.5" fill="#744210">The change-management recorder still takes the slot that way, and an open question owns the disposition.</text>
+
+  <defs>
+    <marker id="snapshot-components-blue" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto"><path d="M0,0 L0,7 L9,3.5 z" fill="#2b6cb0"/></marker>
+    <marker id="snapshot-components-amber" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto"><path d="M0,0 L0,7 L9,3.5 z" fill="#b7791f"/></marker>
+    <marker id="snapshot-components-ink" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto"><path d="M0,0 L0,7 L9,3.5 z" fill="#4a5568"/></marker>
+  </defs>
+</svg>
