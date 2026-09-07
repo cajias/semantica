@@ -1,0 +1,158 @@
+---
+# Semantica Knowledge Explorer on AWS App Runner.
+#
+# There is no apprunner.yaml in this directory on purpose. App Runner's
+# configuration file "is applicable only to services that are based on source
+# code. You can't use configuration files with image-based services." This repo
+# ships a Dockerfile, so the service is image-based and is declared here.
+#
+# The snapshot bucket, the instance role and the API-key secret are deliberately
+# NOT in this stack. App Runner bills a service whether or not it is enabled, so
+# an intermittently needed deployment is deleted rather than paused - and the
+# graph has to outlive that. Those three are created once by the commands in
+# README.md; this stack is the disposable half and can be deleted and recreated
+# against the same snapshot.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Semantica Knowledge Explorer on AWS App Runner: exactly one instance, TLS
+  terminated by the platform, context graph snapshotted to a single S3 object.
+  Deliberately no VPC, load balancer, NAT gateway or security group - see
+  docs/design/aws-integration for why each was rejected.
+
+Parameters:
+  ServiceName:
+    Type: String
+    Default: semantica-knowledge-explorer
+    Description: App Runner service name. Must be unique per account per region.
+
+  ImageIdentifier:
+    Type: String
+    Description: >-
+      ECR image URI, e.g.
+      <AWS-ACCOUNT-ID>.dkr.ecr.<REGION>.amazonaws.com/semantica-explorer:latest.
+      The image must carry boto3, which the stock Dockerfile installs with the
+      snapshot-s3 extra.
+
+  AccessRoleArn:
+    Type: String
+    Description: >-
+      IAM role App Runner assumes to pull the image from private ECR (trusts
+      build.apprunner.amazonaws.com). A deployment-time concern only.
+
+  InstanceRoleArn:
+    Type: String
+    Description: >-
+      IAM role the running container assumes (trusts
+      tasks.apprunner.amazonaws.com). This is what lets the container reach S3
+      without holding long-lived access keys. Carries instance-role-policy.json.
+
+  SnapshotUri:
+    Type: String
+    Description: >-
+      s3://<YOUR-BUCKET>/<KEY> - the one object the graph is snapshotted to. Any
+      value without the s3:// scheme is treated as a local path instead, which on
+      App Runner means the snapshot dies with the container.
+    AllowedPattern: '^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/.+$'
+    ConstraintDescription: Must be s3://<bucket>/<key> naming one object, not a bucket or a prefix.
+
+  SnapshotInterval:
+    Type: String
+    Default: '30'
+    Description: >-
+      Seconds between snapshots. This is a data-loss budget, not a tuning
+      preference: an abrupt kill loses up to this many seconds of edits.
+
+  AllowedOrigins:
+    Type: String
+    Description: >-
+      Comma-separated browser origins for the CORS allowlist and the WebSocket
+      Origin check. The bundled UI is same-origin, so this only matters to
+      cross-origin API callers and to the /ws/graph-updates handshake, which
+      rejects any Origin not named here. Set it to the deployment's real domain;
+      the application default names localhost.
+
+  ApiKeySecretArn:
+    Type: String
+    Description: >-
+      Secrets Manager ARN holding the SEMANTICA_API_KEY value. Passed by
+      reference, so the key never appears in the stack or the service config.
+
+Resources:
+  # Exactly one instance, always. Two containers would each hold a private,
+  # diverging copy of the in-memory graph and their snapshots would overwrite
+  # each other. MaxSize is the enforcement. MaxConcurrency is deliberately left
+  # high: it is the per-instance request limit that triggers scale-out, so
+  # lowering it on a service that cannot scale would only throttle the UI.
+  #
+  # This does not cover deployments. App Runner "temporarily doubles the number
+  # of provisioned instances during deployments, to maintain the same capacity
+  # for both old and new code", so a redeploy briefly runs two graphs. See the
+  # redeployment note in README.md.
+  SingleInstanceScaling:
+    Type: AWS::AppRunner::AutoScalingConfiguration
+    Properties:
+      AutoScalingConfigurationName: semantica-explorer-1x
+      MinSize: 1
+      MaxSize: 1
+      MaxConcurrency: 100
+
+  Service:
+    Type: AWS::AppRunner::Service
+    Properties:
+      ServiceName: !Ref ServiceName
+      # Ref on an auto scaling configuration returns the name, not the ARN.
+      AutoScalingConfigurationArn: !GetAtt SingleInstanceScaling.AutoScalingConfigurationArn
+      HealthCheckConfiguration:
+        # The Explorer app serves /api/health. semantica/server.py serves /health
+        # instead, but the image runs the Explorer, so /health would 404 here and
+        # the service would never reach a healthy state.
+        Protocol: HTTP
+        Path: /api/health
+        Interval: 10
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 5
+      InstanceConfiguration:
+        Cpu: 1 vCPU
+        Memory: 2 GB
+        InstanceRoleArn: !Ref InstanceRoleArn
+      SourceConfiguration:
+        # Off on purpose: every redeployment carries the two-instance overlap
+        # described above, so it should be a decision, not an ECR push.
+        AutoDeploymentsEnabled: false
+        AuthenticationConfiguration:
+          AccessRoleArn: !Ref AccessRoleArn
+        ImageRepository:
+          ImageIdentifier: !Ref ImageIdentifier
+          ImageRepositoryType: ECR
+          ImageConfiguration:
+            # The Dockerfile exposes 8000 and uvicorn binds it.
+            Port: '8000'
+            RuntimeEnvironmentVariables:
+              - Name: SEMANTICA_SNAPSHOT_URI
+                Value: !Ref SnapshotUri
+              - Name: SEMANTICA_SNAPSHOT_INTERVAL
+                Value: !Ref SnapshotInterval
+              # Canonical name. ALLOWED_ORIGINS is still read but deprecated,
+              # and the image bakes it into its ENV - setting the canonical name
+              # here outranks that and keeps the deprecation warning off the log.
+              - Name: SEMANTICA_CORS_ORIGINS
+                Value: !Ref AllowedOrigins
+            # A missing SEMANTICA_API_KEY makes every protected route answer 503.
+            # It does not fall back to anonymous access, so this is required, and
+            # SEMANTICA_ALLOW_ANONYMOUS is a development-only escape hatch that
+            # must never be set here.
+            RuntimeEnvironmentSecrets:
+              - Name: SEMANTICA_API_KEY
+                Value: !Ref ApiKeySecretArn
+
+Outputs:
+  ServiceUrl:
+    Description: >-
+      Public HTTPS endpoint. Feed this back into AllowedOrigins on a second
+      deploy unless you are attaching a custom domain.
+    Value: !Sub https://${Service.ServiceUrl}
+
+  ServiceArn:
+    Description: Service ARN, for aws apprunner delete-service when tearing down.
+    Value: !GetAtt Service.ServiceArn

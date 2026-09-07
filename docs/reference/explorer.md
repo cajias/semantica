@@ -100,16 +100,21 @@ The `semantica-explorer` command accepts exactly four flags:
 | `--no-browser` |: | off | Skip auto-opening the browser tab |
 
 <Note>
-  There are no flags for authentication, CORS, or log level in the CLI. CORS allowed origins are configured via the `EXPLORER_CORS_ORIGINS` environment variable (comma-separated, default: `http://localhost:5173,http://127.0.0.1:5173`).
+  There are no flags for authentication, CORS, or log level in the CLI. CORS allowed origins are configured via the `SEMANTICA_CORS_ORIGINS` environment variable (comma-separated, default: `http://localhost:5173,http://127.0.0.1:5173`). The older `ALLOWED_ORIGINS` and `EXPLORER_CORS_ORIGINS` names are still honoured, in that order of precedence, but log a deprecation warning naming their replacement. `semantica-server` reads the same variable, so both entry points allow the same origins.
+
+  Graph persistence is environment-only too. `SEMANTICA_SNAPSHOT_URI` (default unset) names a snapshot destination — an `s3://bucket/key` URI, which needs `boto3` installed, or a plain filesystem path; any other URI scheme is rejected at start-up rather than treated as a path. Unset means snapshots are disabled and the in-memory graph is lost when the process exits. When it is set, an existing snapshot at that destination is restored into the graph at start-up, replacing the graph loaded from `--graph`. `SEMANTICA_SNAPSHOT_INTERVAL` (default `30`) is the number of seconds between snapshots of a changed graph — the data-loss budget for an unclean exit; a value that is not a positive whole number warns and falls back to `30`. `semantica-server` reads both variables identically.
 </Note>
 
 <Tip>
-  **CORS origins are configured via environment variable.** Set `EXPLORER_CORS_ORIGINS` to a comma-separated list of allowed origins before launching (e.g. `EXPLORER_CORS_ORIGINS="http://myapp.example.com"`).
+  **In production, set the origins to the deployment's own domain.** The default names local addresses, which is correct for development and wrong everywhere else — a deployment left at the default refuses every browser request from its real site, and the only symptom is a CORS error in the browser console. Give `SEMANTICA_CORS_ORIGINS` the exact origins the UI is served from: scheme, host and port, no trailing slash, comma-separated.
 </Tip>
 
 ```bash
-# Full example
-EXPLORER_CORS_ORIGINS="http://myapp.example.com" \
+# Local development — the default already covers this, no configuration needed
+semantica-explorer --graph my_graph.json
+
+# Production — the deployment's real domain, not localhost
+SEMANTICA_CORS_ORIGINS="https://kg.example.com,https://admin.example.com" \
   semantica-explorer --graph my_graph.json --host 0.0.0.0 --port 8080 --no-browser
 ```
 

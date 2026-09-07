@@ -64,7 +64,6 @@ import hashlib
 import os
 import re
 import stat
-import tempfile
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -77,6 +76,7 @@ import yaml
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
 from ..utils.types import EntityDict, RelationshipDict
+from ._atomic_write import atomic_write_text
 from ._markdown_filesystem import find_filesystem_link
 
 
@@ -1749,28 +1749,14 @@ class AgentMemory:
                 f"{file_path}"
             )
 
-        temporary_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(file_path.parent),
-                prefix=f".{file_path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as temporary_file:
-                temporary_path = Path(temporary_file.name)
-                temporary_file.write(document)
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-
-            # os.replace swaps the directory entry itself, so a raced symlink is
-            # replaced rather than followed.
-            os.replace(temporary_path, file_path)
-            temporary_path = None
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        # The helper replaces the directory entry, so a raced symlink is
+        # replaced rather than followed. 0600 rather than the helper's
+        # umask-derived default: memory holds whatever the agent was told to
+        # remember, so on a shared host or multi-uid container a memory file
+        # must not be world-readable, including when an overwrite finds one that
+        # already is. This is what NamedTemporaryFile +
+        # os.replace gave these files before the writer was shared.
+        atomic_write_text(file_path, document, mode=0o600)
 
     def _memory_to_markdown(self, memory: Dict[str, Any]) -> str:
         memory_id = memory.get("memory_id")

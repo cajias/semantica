@@ -178,6 +178,11 @@ cloud = [
   "google-cloud-storage>=2.5.0"
 ]
 
+# ---- Snapshot persistence ----
+# Only what semantica/context/snapshot.py needs for an ``s3://`` snapshot URI;
+# the broader ``cloud`` extra also pulls azure/gcs, which snapshot.py never uses.
+snapshot-s3 = ["boto3>=1.24.0"]
+
 # ---- Monitoring (FIXED) ----
 monitoring = [
   "prometheus-client>=0.14.0",
@@ -252,8 +257,8 @@ explorer-lite = [
 # (CVE-2026-45829) with no fixed release — including it here would fail the CI
 # dependency-audit/security gates.  Install it explicitly via ``semantica[crewai]``.
 all = [
-  "semantica[dev,viz,infra,cloud,monitoring,watch,llm-all,models-huggingface,split-all,graph-all,tripletstore-oxigraph,vectorstore-all,parse-docling,ingest-parquet,ingest-arrow,shacl,explorer]",
-  "semantica[dev,viz,infra,cloud,monitoring,watch,llm-all,models-huggingface,split-all,graph-all,tripletstore-oxigraph,vectorstore-all,parse-docling,ingest-parquet,ingest-arrow,shacl,agno]"
+  "semantica[dev,viz,infra,cloud,snapshot-s3,monitoring,watch,llm-all,models-huggingface,split-all,graph-all,tripletstore-oxigraph,vectorstore-all,parse-docling,ingest-parquet,ingest-arrow,shacl,explorer]",
+  "semantica[dev,viz,infra,cloud,snapshot-s3,monitoring,watch,llm-all,models-huggingface,split-all,graph-all,tripletstore-oxigraph,vectorstore-all,parse-docling,ingest-parquet,ingest-arrow,shacl,agno]"
 ]
 
 # ---------------- ENTRYPOINTS ----------------

@@ -8,14 +8,29 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import __version__
 from ..context.context_graph import ContextGraph
-from .dependencies import anonymous_access_allowed, get_expected_api_key, is_valid_api_key, require_auth
+from ..context.snapshot import SNAPSHOT_URI_ENV, SnapshotService
+from ..utils import cors
+from ..utils.security_headers import SecurityHeadersMiddleware
+from .dependencies import (
+    anonymous_access_allowed,
+    get_expected_api_key,
+    is_valid_api_key,
+    require_auth,
+)
 from .session import GraphSession
 from .ws import ConnectionManager
 
@@ -31,16 +46,12 @@ def _read_int_env(name: str, default: int) -> int:
 
 
 def _read_explorer_settings() -> dict:
-    if "ALLOWED_ORIGINS" in os.environ:
-        raw_origins = os.environ["ALLOWED_ORIGINS"]
-    elif "EXPLORER_CORS_ORIGINS" in os.environ:
-        raw_origins = os.environ["EXPLORER_CORS_ORIGINS"]
-    else:
-        raw_origins = "http://localhost:5173,http://127.0.0.1:5173"
+    # Resolved by semantica.utils.cors, which semantica/server.py also calls, so
+    # the two entry points cannot honour different environment variable names.
+    cors_settings = cors.resolve_cors_settings()
     return {
-        "allowed_origins": [
-            origin.strip() for origin in raw_origins.split(",") if origin.strip()
-        ],
+        "allowed_origins": cors_settings.origins,
+        "allow_credentials": cors_settings.allow_credentials,
         # These are read and stored for future use when direct FalkorDB connection
         # support is added to the Explorer. Currently GraphSession uses an in-memory
         # ContextGraph and does not open a network connection to FalkorDB.
@@ -95,10 +106,16 @@ def create_app(
         active_session = session
         if prov_path is not None:
             active_session.set_provenance_storage_path(prov_path)
+    # `semantica-explorer --graph` loads a file, prints its node/edge counts and
+    # hands the session in here. Restoring a snapshot over that would serve
+    # something other than what the operator was just told was loaded, so the
+    # explicit command-line graph wins -- see the lifespan below.
+    preloaded_graph = session is not None and bool(active_session.graph.nodes)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         import logging as _lifespan_logging
+
         _lifespan_logger = _lifespan_logging.getLogger(__name__)
         if anonymous_access_allowed():
             _lifespan_logger.warning(
@@ -107,7 +124,9 @@ def create_app(
                 "process beyond localhost."
             )
         elif get_expected_api_key():
-            _lifespan_logger.info("Explorer API authentication: enabled (SEMANTICA_API_KEY set).")
+            _lifespan_logger.info(
+                "Explorer API authentication: enabled (SEMANTICA_API_KEY set)."
+            )
         else:
             _lifespan_logger.warning(
                 "Explorer API authentication: NOT CONFIGURED. All protected "
@@ -118,7 +137,31 @@ def create_app(
         app.state.ws_manager = ConnectionManager()
         app.state.session = active_session
         _install_mutation_bridge(app, active_session)
+        snapshots = SnapshotService.from_env(
+            active_session.graph, after_restore=active_session.reload_graph
+        )
+        snapshot_uri = os.environ.get(SNAPSHOT_URI_ENV)
+        if preloaded_graph and snapshot_uri:
+            # WARNING, not INFO: nothing here configures logging, so under
+            # uvicorn's dictConfig every INFO record is dropped and the
+            # operator would never learn which graph won.
+            _lifespan_logger.warning(
+                "%s=%s will NOT be restored: this process was started with a "
+                "graph already loaded (%d nodes), and an explicit graph "
+                "outranks ambient snapshot state. Later edits are still "
+                "snapshotted to that destination, replacing what is there.",
+                SNAPSHOT_URI_ENV,
+                snapshot_uri,
+                len(active_session.graph.nodes),
+            )
+        else:
+            snapshots.restore()
+        # After restore(), so replayed nodes cannot mark the graph dirty.
+        snapshots.start()
         yield
+        # Stops the writer and takes a final snapshot if the graph is dirty,
+        # which is what makes an ordinary redeployment lossless.
+        snapshots.stop()
 
     app = FastAPI(
         title="Semantica Knowledge Explorer",
@@ -132,19 +175,24 @@ def create_app(
     # allow_credentials lets browsers send cookies/auth headers cross-origin.
     # Credentials aren't needed for the X-API-Key auth scheme below, and
     # enabling them when origins are broadened creates cross-site request
-    # risk. Set EXPLORER_CORS_CREDENTIALS=true explicitly to opt in (e.g.
+    # risk. Set SEMANTICA_CORS_CREDENTIALS=true explicitly to opt in (e.g.
     # for a reverse-proxy setup that injects its own cookie-based auth).
-    _allow_credentials = os.environ.get("EXPLORER_CORS_CREDENTIALS", "false").lower() == "true"
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings["allowed_origins"],
-        allow_credentials=_allow_credentials,
+        allow_credentials=settings["allow_credentials"],
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "Authorization", "X-API-Key"],
         max_age=600,
     )
 
+    # Defined in semantica.utils.security_headers, which semantica/server.py
+    # also installs, so the two entry points cannot ship different header
+    # policies -- this is the app the container and App Runner actually run.
+    app.add_middleware(SecurityHeadersMiddleware)
+
     import logging as _logging
+
     _logger = _logging.getLogger(__name__)
 
     @app.exception_handler(KeyError)
@@ -162,7 +210,9 @@ def create_app(
         if isinstance(exc, HTTPException):
             raise exc
         _logger.exception("Unhandled exception")
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        return JSONResponse(
+            status_code=500, content={"detail": "Internal server error"}
+        )
 
     from .routes.analytics import router as analytics_router
     from .routes.annotations import router as annotations_router
@@ -204,16 +254,31 @@ def create_app(
         # cross-origin WebSocket handshake; native/CLI clients omit it
         # entirely, so a missing Origin is allowed through — the browser is
         # the only threat this check is closing.
+        #
+        # "*" is honoured exactly as the HTTP layer honours it
+        # (semantica.utils.cors), as a blanket allow. A literal "*" matches no
+        # real Origin header, so treating it as an ordinary list entry would
+        # leave SEMANTICA_CORS_ORIGINS=* wide open over HTTP while refusing
+        # every browser here — including the deployment's own page, whose live
+        # graph updates would silently never connect. The resolver has already
+        # dropped allow_credentials for that pairing, so there is no
+        # credentialed variant of the wildcard to mirror.
         origin = websocket.headers.get("origin")
         allowed_origins = app.state.explorer_settings["allowed_origins"]
-        if origin is not None and origin not in allowed_origins:
+        if (
+            origin is not None
+            and "*" not in allowed_origins
+            and origin not in allowed_origins
+        ):
             await websocket.close(code=4403)  # forbidden
             return
 
         # Browsers can't set custom headers on a WebSocket handshake, so
         # accept the key via header (non-browser clients) or query param
         # (browser clients), same SEMANTICA_API_KEY the REST routes check.
-        candidate = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
+        candidate = websocket.headers.get("x-api-key") or websocket.query_params.get(
+            "api_key"
+        )
         if not is_valid_api_key(candidate):
             await websocket.close(code=4401)  # unauthorized
             return
@@ -244,9 +309,9 @@ def create_app(
         )
         return HTMLResponse(
             '<!doctype html><html lang="en"><head><meta charset="UTF-8">'
-            '<title>Semantica Knowledge Explorer</title>'
-            '<style>body{font-family:sans-serif;padding:2rem;max-width:600px;margin:auto}'
-            'code{background:#f4f4f4;padding:2px 6px;border-radius:3px}</style></head>'
+            "<title>Semantica Knowledge Explorer</title>"
+            "<style>body{font-family:sans-serif;padding:2rem;max-width:600px;margin:auto}"
+            "code{background:#f4f4f4;padding:2px 6px;border-radius:3px}</style></head>"
             "<body><h2>Explorer UI not available</h2>"
             "<p>The frontend bundle was not found. This usually means the package was "
             "installed from source without building the frontend first.</p>"

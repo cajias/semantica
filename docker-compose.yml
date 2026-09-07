@@ -13,11 +13,27 @@ services:
       SEMANTICA_API_KEY: ${SEMANTICA_API_KEY:-}
       # Trusted local-only setups only: bypasses the API key entirely.
       SEMANTICA_ALLOW_ANONYMOUS: ${SEMANTICA_ALLOW_ANONYMOUS:-false}
+      # Where the graph snapshot lives. The default local path below works out
+      # of the box on the `snapshot_data` volume. An `s3://bucket/key` value
+      # selects S3 instead and additionally needs AWS credentials in the
+      # container; without them start-up fails and `restart: unless-stopped`
+      # will retry it forever.
+      SEMANTICA_SNAPSHOT_URI: ${SEMANTICA_SNAPSHOT_URI:-/data/graph-snapshot.json}
+      # Seconds between snapshot writes. 30 matches the default in code.
+      SEMANTICA_SNAPSHOT_INTERVAL: ${SEMANTICA_SNAPSHOT_INTERVAL:-30}
     depends_on:
       falkordb:
         condition: service_started
     ports:
       - "8000:8000"
+    volumes:
+      # Named volume so the snapshot outlives container recreation. The
+      # Dockerfile pre-creates /data and chowns it to the non-root `semantica`
+      # user: Docker only propagates ownership to a fresh named volume from a
+      # directory that already exists in the image -- a mountpoint Docker has
+      # to create itself is always root:root 0755, which the runtime user
+      # cannot write.
+      - snapshot_data:/data
     networks:
       - semantica
     restart: unless-stopped
@@ -38,3 +54,4 @@ networks:
 
 volumes:
   falkordb_data:
+  snapshot_data:

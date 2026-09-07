@@ -146,13 +146,23 @@ python -c "import semantica; print(semantica.__version__)"
 | `SEMANTICA_KG_PATH` | *(none)* | Path to a saved graph file to load on startup |
 | `SEMANTICA_LOG_LEVEL` | `WARNING` | Log verbosity: `DEBUG`, `INFO`, `WARNING` |
 
-`semantica-server` reads one:
+`semantica-server` and `semantica-explorer` resolve their CORS and snapshot
+configuration from the same variables, so both commands behave identically:
 
 | Variable | Default | Description |
 | :-------- | :------- | :----------- |
-| `SEMANTICA_CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated list of allowed CORS origins |
+| `SEMANTICA_CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated browser origins allowed to call the API. **Set this to the deployment's own domain in production** — the default names local addresses only, so a deployment left at the default refuses every request from its real site. Deprecated aliases `ALLOWED_ORIGINS` then `EXPLORER_CORS_ORIGINS` are still honoured at lower precedence, with a warning. |
+| `SEMANTICA_CORS_CREDENTIALS` | `false` | Set to `true` to allow credentialed cross-origin requests. Not needed for `X-API-Key` authentication, which is an ordinary header — only for a reverse proxy that injects cookie-based auth. Deprecated alias: `EXPLORER_CORS_CREDENTIALS`. |
+| `SEMANTICA_SNAPSHOT_URI` | *(unset)* | Destination for periodic context-graph snapshots: either an `s3://bucket/key` URI (needs `boto3` installed) or a plain filesystem path. Unset means snapshots are **disabled** and the in-memory graph is lost when the process exits. When set, a snapshot already at the destination is restored into the graph at start-up, replacing what was loaded from disk. Any other URI scheme — `file://`, `https://`, `s3:/` with one slash — is rejected at start-up rather than treated as a path. |
+| `SEMANTICA_SNAPSHOT_INTERVAL` | `30` | Seconds between snapshots when the graph has changed — in effect the data-loss budget for an unclean exit. Only consulted when `SEMANTICA_SNAPSHOT_URI` is set. A value that is not a positive whole number logs a warning and falls back to `30`. |
 
-No other environment variables are read by these commands.
+Setting `SEMANTICA_CORS_ORIGINS` to `*` is honoured but warned about, and if
+credentials are also enabled the credentials are dropped: that pairing makes
+every site an allowed origin rather than being refused by the browser.
+
+Those are the CORS and snapshot variables. Authentication is configured
+separately — see [Explorer Setup](explorer-setup) for `SEMANTICA_API_KEY` and
+`SEMANTICA_ALLOW_ANONYMOUS`.
 
 
 ## Troubleshooting

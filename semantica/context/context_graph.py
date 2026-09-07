@@ -118,6 +118,7 @@ from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
 from ..utils.helpers import classify_path_distance
 from ..utils.skos import is_skos_hierarchy_edge, validate_skos_hierarchy
+from ._atomic_write import atomic_replace
 from .entity_linker import EntityLinker
 
 # Optional imports for advanced features
@@ -421,7 +422,11 @@ class ContextEdge:
             "target_id": self.target_id,
             "type": self.edge_type,
             "weight": self.weight,
-            "properties": self.metadata,
+            # Copied, like ContextNode.to_dict: save_to_file builds the payload
+            # under the lock and dumps it outside, so handing out the live dict
+            # lets an in-place edit tear the snapshot mid-serialisation. Shallow,
+            # matching the sibling -- nested values stay shared.
+            "properties": self.metadata.copy(),
         }
         if self.valid_from is not None:
             d["valid_from"] = self.valid_from
@@ -1101,14 +1106,22 @@ class ContextGraph:
                 )
             )
 
-    def save_to_file(self, path: str) -> None:
+    def save_to_file(self, path: str, mode: Optional[int] = None) -> None:
         """
         Save context graph to file (JSON format).
 
+        Written atomically, so needs write permission on the destination's
+        directory, not just on the file.
+
         Args:
             path: File path to save to
+            mode: Permission bits to enforce on the written file. Left None the
+                file keeps the mode it had, or gets the umask default when new;
+                pass ``0o600`` when the destination holds a whole graph an
+                operator would not want world-readable.
         """
         import json
+        import os
 
         with self._lock:
     
@@ -1128,9 +1141,18 @@ class ContextGraph:
                 "nodes": [node.to_dict() for node in self.nodes.values()],
                 "edges": [edge.to_dict() for edge in self.edges],
                 "links": links_data,
+                # Lists, not objects: the in-memory key is the
+                # ``(entity_kind, entity_id)`` tuple JSON cannot express, and
+                # each record already carries both halves, so the key is rebuilt
+                # on load without inventing a separator an id could contain.
+                "retractions": [dict(r) for r in self._retractions.values()],
+                "tombstones": [dict(r) for r in self._tombstones.values()],
             }
 
-        with open(path, "w", encoding="utf-8") as f:
+        # os.replace swaps the final path component, so resolve symlinks first
+        # to keep writing *through* a symlinked snapshot path the way
+        # open(path, "w") did instead of replacing the link with a regular file.
+        with atomic_replace(os.path.realpath(path), mode) as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         self.logger.info(f"Saved context graph to {path}")
@@ -1177,6 +1199,23 @@ class ContextGraph:
             # would make entities in the loaded graph read as already retracted.
             self._retractions.clear()
             self._tombstones.clear()
+            # The payload brings its own, so the retraction/purge audit record
+            # survives a restart rather than only its effect. Each record
+            # carries the kind and id that form its key. An absent key is a
+            # snapshot written before these were serialized: it loads with no
+            # records, exactly as it did then.
+            for records, payload_key in (
+                (self._retractions, "retractions"),
+                (self._tombstones, "tombstones"),
+            ):
+                for record in data.get(payload_key) or []:
+                    if not isinstance(record, dict):
+                        continue
+                    entity_id = record.get("entity_id")
+                    if not entity_id:
+                        continue
+                    kind = record.get("entity_kind") or "node"
+                    records[(kind, entity_id)] = dict(record)
 
             if "graph_id" in data:
                 self.graph_id = data["graph_id"]

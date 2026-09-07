@@ -17,9 +17,9 @@
   <rect x="44" y="216" width="176" height="26" rx="6" fill="#ebf4ff" stroke="#2b6cb0" stroke-width="1.5"/>
   <text x="132" y="234" text-anchor="middle" font-size="13" fill="#1a202c">MCP server</text>
 
-  <path d="M 220 143 L 300 168" stroke="#2b6cb0" stroke-width="1.6" fill="none" marker-end="url(#ar)"/>
-  <path d="M 220 189 L 300 176" stroke="#2b6cb0" stroke-width="1.6" fill="none" marker-end="url(#ar)"/>
-  <path d="M 220 229 L 300 186" stroke="#2b6cb0" stroke-width="1.6" fill="none" marker-end="url(#ar)"/>
+  <path d="M 220 143 L 300 168" stroke="#2b6cb0" stroke-width="1.6" fill="none" marker-end="url(#constraint-map-blue)"/>
+  <path d="M 220 189 L 300 176" stroke="#2b6cb0" stroke-width="1.6" fill="none" marker-end="url(#constraint-map-blue)"/>
+  <path d="M 220 229 L 300 186" stroke="#2b6cb0" stroke-width="1.6" fill="none" marker-end="url(#constraint-map-blue)"/>
   <text x="258" y="126" text-anchor="middle" font-size="11" fill="#4a5568">each creates</text>
 
   <rect x="312" y="132" width="238" height="94" rx="8" fill="#ffffff" stroke="#2b6cb0" stroke-width="2.5"/>
@@ -28,14 +28,14 @@
   <text x="431" y="199" text-anchor="middle" font-size="12" fill="#4a5568">ordinary process memory</text>
   <text x="431" y="217" text-anchor="middle" font-size="12" font-weight="600" fill="#c53030">no storage backend</text>
 
-  <path d="M 550 179 L 618 179" stroke="#a0aec0" stroke-width="1.6" fill="none" marker-end="url(#ar2)"/>
+  <path d="M 550 179 L 618 179" stroke="#a0aec0" stroke-width="1.6" fill="none" marker-end="url(#constraint-map-grey)"/>
   <rect x="626" y="146" width="266" height="66" rx="8" fill="#fffaf0" stroke="#b7791f" stroke-width="1.5"/>
   <text x="759" y="172" text-anchor="middle" font-size="13" font-weight="600" fill="#744210">Lives and dies with the process</text>
   <text x="759" y="193" text-anchor="middle" font-size="12" fill="#744210">one instance only, restart erases it</text>
 
   <!-- ===== BARRIER ===== -->
   <line x1="60" y1="286" x2="880" y2="286" stroke="#c53030" stroke-width="2.5" stroke-dasharray="10 7"/>
-  <rect x="352" y="270" width="236" height="32" rx="16" fill="#fff5f5" stroke="#c53030" stroke-width="1.5"/>
+  <rect x="344" y="270" width="252" height="32" rx="16" fill="#fff5f5" stroke="#c53030" stroke-width="1.5"/>
   <text x="470" y="291" text-anchor="middle" font-size="12.5" font-weight="600" fill="#c53030">no selectable path between them</text>
 
   <!-- ===== LOWER BAND: library only ===== -->
@@ -47,14 +47,15 @@
   <text x="144" y="408" text-anchor="middle" font-size="11.5" fill="#4a5568">recorder, query, causal</text>
   <text x="144" y="424" text-anchor="middle" font-size="11.5" fill="#4a5568">analyser, policy engine</text>
 
-  <path d="M 244 400 L 306 400" stroke="#2f855a" stroke-width="1.6" fill="none" marker-end="url(#ar3)"/>
-  <text x="275" y="392" text-anchor="middle" font-size="11" fill="#4a5568">written against</text>
+  <path d="M 244 400 L 306 400" stroke="#2f855a" stroke-width="1.6" fill="none" marker-end="url(#constraint-map-green)"/>
+  <text x="275" y="381" text-anchor="middle" font-size="11" fill="#4a5568">written</text>
+  <text x="275" y="394" text-anchor="middle" font-size="11" fill="#4a5568">against</text>
 
   <rect x="314" y="368" width="196" height="64" rx="8" fill="#ffffff" stroke="#2f855a" stroke-width="2.5"/>
   <text x="412" y="394" text-anchor="middle" font-size="14" font-weight="600" fill="#1a202c">Graph store facade</text>
   <text x="412" y="415" text-anchor="middle" font-size="12" fill="#4a5568">backend is injected</text>
 
-  <path d="M 510 400 L 566 400" stroke="#2f855a" stroke-width="1.6" fill="none" marker-end="url(#ar3)"/>
+  <path d="M 510 400 L 566 400" stroke="#2f855a" stroke-width="1.6" fill="none" marker-end="url(#constraint-map-green)"/>
 
   <rect x="574" y="352" width="146" height="32" rx="6" fill="#f0fff4" stroke="#2f855a" stroke-width="1.3"/>
   <text x="647" y="373" text-anchor="middle" font-size="12" fill="#1a202c">Neo4j</text>
@@ -65,14 +66,14 @@
 
   <rect x="736" y="390" width="156" height="70" rx="6" fill="#fffaf0" stroke="#b7791f" stroke-width="2.5"/>
   <text x="814" y="414" text-anchor="middle" font-size="13" font-weight="600" fill="#744210">Amazon Neptune</text>
-  <text x="814" y="433" text-anchor="middle" font-size="11.5" fill="#744210">works today, but is</text>
-  <text x="814" y="449" text-anchor="middle" font-size="11.5" fill="#744210">unreachable from a service</text>
-  <path d="M 720 424 L 730 424" stroke="#b7791f" stroke-width="1.6" fill="none" marker-end="url(#ar4)"/>
+  <text x="814" y="433" text-anchor="middle" font-size="11.5" fill="#744210">works today, but no</text>
+  <text x="814" y="449" text-anchor="middle" font-size="11.5" fill="#744210">entry point reaches it</text>
+  <path d="M 510 425 L 734 425" stroke="#b7791f" stroke-width="1.6" fill="none" marker-end="url(#constraint-map-amber)"/>
 
   <defs>
-    <marker id="ar" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#2b6cb0"/></marker>
-    <marker id="ar2" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#a0aec0"/></marker>
-    <marker id="ar3" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#2f855a"/></marker>
-    <marker id="ar4" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#b7791f"/></marker>
+    <marker id="constraint-map-blue" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#2b6cb0"/></marker>
+    <marker id="constraint-map-grey" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#a0aec0"/></marker>
+    <marker id="constraint-map-green" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#2f855a"/></marker>
+    <marker id="constraint-map-amber" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#b7791f"/></marker>
   </defs>
 </svg>
